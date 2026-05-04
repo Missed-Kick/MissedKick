@@ -1,0 +1,5 @@
+# Dev tools - not part of the addon
+*.ps1
+*.bat
+.vscode/
+releases/
