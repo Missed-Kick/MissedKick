@@ -11,6 +11,17 @@ local ICON_SZ        = 18
 local CAST_SCAN_RATE = 0.2
 local CD_UPDATE_RATE = 0.1
 
+local MARKER_OUTLINE_TEXTURES = {
+    [1] = "Interface\\AddOns\\MissedKick\\Textures\\MarkerOutline_1.png",
+    [2] = "Interface\\AddOns\\MissedKick\\Textures\\MarkerOutline_2.png",
+    [3] = "Interface\\AddOns\\MissedKick\\Textures\\MarkerOutline_3.png",
+    [4] = "Interface\\AddOns\\MissedKick\\Textures\\MarkerOutline_4.png",
+    [5] = "Interface\\AddOns\\MissedKick\\Textures\\MarkerOutline_5.png",
+    [6] = "Interface\\AddOns\\MissedKick\\Textures\\MarkerOutline_6.png",
+    [7] = "Interface\\AddOns\\MissedKick\\Textures\\MarkerOutline_7.png",
+    [8] = "Interface\\AddOns\\MissedKick\\Textures\\MarkerOutline_8.png",
+}
+
 local CLASS_COLORS = {
     WARRIOR={0.78,0.61,0.43}, PALADIN={0.96,0.55,0.73}, HUNTER={0.67,0.83,0.45},
     ROGUE={1.00,0.96,0.41}, PRIEST={1.00,1.00,1.00}, DEATHKNIGHT={0.77,0.12,0.23},
@@ -195,6 +206,9 @@ local function GetCastRow(parent, i)
     row.borderLeft:SetColorTexture(1, 0.05, 0.05, 1)
     row.borderRight:SetColorTexture(1, 0.05, 0.05, 1)
     row.borderTop:Hide(); row.borderBottom:Hide(); row.borderLeft:Hide(); row.borderRight:Hide()
+    row.outlineAtlas = row.textLayer:CreateTexture(nil, "OVERLAY")
+    row.outlineAtlas:SetAllPoints(row)
+    row.outlineAtlas:Hide()
     row.time = row.fill:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     row.time:SetPoint("RIGHT", -6, 0); row.time:SetJustifyH("RIGHT"); row.time:SetWidth(34)
     castRows[i] = row; return row
@@ -300,6 +314,39 @@ local function SetCastOutlineAlpha(row, alpha)
     row.borderBottom:SetAlpha(alpha)
     row.borderLeft:SetAlpha(alpha)
     row.borderRight:SetAlpha(alpha)
+end
+
+local function ClearCastOutline(row)
+    SetCastOutlineAlpha(row, 0)
+    if row.outlineAtlas then
+        row.outlineAtlas:Hide()
+    end
+end
+
+local function SetCastOutlineForMarker(row, assignedMarker, markerForRow, markerShown)
+    ClearCastOutline(row)
+
+    if not (assignedMarker and markerShown and row.outlineAtlas and SetRaidTargetIconTexture) then
+        return false
+    end
+
+    local texturePath = MARKER_OUTLINE_TEXTURES[assignedMarker]
+    if not texturePath then return false end
+
+    row.outlineAtlas:SetTexture(texturePath)
+    local ok = pcall(SetRaidTargetIconTexture, row.outlineAtlas, markerForRow)
+    if not ok and row.outlineAtlas.SetSpriteSheetCell then
+        ok = pcall(row.outlineAtlas.SetSpriteSheetCell, row.outlineAtlas, markerForRow,
+            RAID_TARGET_TEXTURE_ROWS or 4, RAID_TARGET_TEXTURE_COLUMNS or 4)
+    end
+
+    if ok then
+        row.outlineAtlas:Show()
+        return true
+    end
+
+    row.outlineAtlas:Hide()
+    return false
 end
 
 local function SetCastMarker(row, unit, markerIndex)
@@ -461,7 +508,7 @@ local function RefreshCasts()
         SetCastFillColor(row, 0.78,0.46,0.06,0.86)
         SetCastFill(row, c, pct)
         local assignedMarker = GetAssignedMarkerIndex()
-        local outlineAlpha = (assignedMarker and markerShown) and 1 or 0
+        local outlineAtlasApplied = SetCastOutlineForMarker(row, assignedMarker, markerForRow, markerShown)
         if MissedKick and MissedKick.IsDebugEnabled and MissedKick.IsDebugEnabled()
             and MissedKick.DebugPrint and now >= nextOutlineDebug then
             nextOutlineDebug = now + 1.5
@@ -475,9 +522,9 @@ local function RefreshCasts()
             MissedKick.DebugPrint("outline assigned=" .. tostring(assigned)
                 .. " markerShown=" .. tostring(markerShown)
                 .. " markerSecret=" .. tostring(markerSecret)
-                .. " mode=marked-fallback")
+                .. " atlasApplied=" .. tostring(outlineAtlasApplied)
+                .. " mode=atlas-match")
         end
-        SetCastOutlineAlpha(row, outlineAlpha)
         local dng, yours = false, false
         if MissedKick.IsDangerousCast then
             local okDanger, isDangerous, isYours = pcall(MissedKick.IsDangerousCast, c.spellID, c.spellName, nil)
@@ -493,7 +540,7 @@ local function RefreshCasts()
         row.time:SetText("")
         y=y+BAR_HEIGHT
     end
-    for i=#casts+1,#castRows do if castRows[i] then castRows[i]._timerUnit=nil; castRows[i]._timerSpell=nil; castRows[i].text:Hide(); castRows[i].prefix:Hide(); castRows[i].enemy:Hide(); castRows[i].sep:Hide(); castRows[i].spell:Hide(); SetCastOutlineAlpha(castRows[i], 0); castRows[i]:Hide() end end
+    for i=#casts+1,#castRows do if castRows[i] then castRows[i]._timerUnit=nil; castRows[i]._timerSpell=nil; castRows[i].text:Hide(); castRows[i].prefix:Hide(); castRows[i].enemy:Hide(); castRows[i].sep:Hide(); castRows[i].spell:Hide(); ClearCastOutline(castRows[i]); castRows[i]:Hide() end end
     castFrame:SetHeight(math.max(y+4, HEADER_H+30))
 end
 

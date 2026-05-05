@@ -23,7 +23,7 @@
 
 local ADDON_NAME = "MissedKick"
 local ADDON_PREFIX = "MISSEDKICK"
-local ADDON_BUILD = "2026-05-05-marker-outline-fallback"
+local ADDON_BUILD = "2026-05-05-marker-outline-atlas"
 
 -------------------------------------------------------------------------------
 -- Interrupt Spell Table
