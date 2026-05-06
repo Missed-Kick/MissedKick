@@ -23,7 +23,7 @@
 
 local ADDON_NAME = "MissedKick"
 local ADDON_PREFIX = "MISSEDKICK"
-local ADDON_BUILD = "2026-05-05-marker-outline-atlas"
+local ADDON_BUILD = "2026-05-05-dungeon-load-mode"
 
 -------------------------------------------------------------------------------
 -- Interrupt Spell Table
@@ -131,7 +131,9 @@ end
 -------------------------------------------------------------------------------
 local DEFAULTS = {
     myMarker       = "none",
-    dangerousCasts = {},     -- { [spellID_number] = true, ["Spell Name"] = true }
+    kickTrackerEnabled = true,
+    nearbyCastsEnabled = true,
+    onlyDungeons = false,
     frameLocked    = false,
     -- framePos is NOT listed here; nil keys are skipped by pairs() and
     -- we never want to accidentally overwrite a saved position.
@@ -160,6 +162,10 @@ local partyKicks = {}
 -- Nearby cast data (rebuilt every scan tick):
 -- nearbyCasts[i] = { unit, enemyName, spellName, spellID, targetName, markerIndex, startTime, endTime, duration }
 local nearbyCasts = {}
+local NAMEPLATE_UNITS = {}
+for i = 1, 40 do
+    NAMEPLATE_UNITS[i] = "nameplate" .. i
+end
 
 -- Rate limiting for addon messages
 local lastBroadcast = 0
@@ -167,9 +173,9 @@ local BROADCAST_THROTTLE = 0.5  -- seconds between broadcasts
 local rosterRebuildScheduled = false
 local testCastsUntil = 0
 local debugEnabled = false
-local recentCombatLogCasts = {}
-local COMBAT_LOG_CAST_TTL = 8
-local lastCombatLogCastPurge = 0
+local lastDebugByKey = {}
+local pendingNearbyCastEvents = {}
+local PENDING_CAST_TTL = 2
 
 -------------------------------------------------------------------------------
 -- Public API (accessed by UI.lua)
@@ -208,6 +214,15 @@ local function DebugPrint(msg)
 end
 MissedKick.DebugPrint = DebugPrint
 function MissedKick.IsDebugEnabled() return debugEnabled end
+
+local function DebugPrintThrottled(key, msg, interval)
+    if not debugEnabled then return end
+    local now = GetTime()
+    interval = interval or 1
+    if (lastDebugByKey[key] or 0) + interval > now then return end
+    lastDebugByKey[key] = now
+    DebugPrint(msg)
+end
 
 local function ResolveInterruptSpell(spellID, spellName)
     if spellName == "Skull Bash" and (not spellID or not INTERRUPT_IDS[spellID]) then
@@ -309,27 +324,54 @@ cleanNumberSlider:SetScript("OnValueChanged", function(_, value)
     cleanNumberValue = value
 end)
 
+local function IsCleanNumber(value)
+    local okType, valueType = pcall(type, value)
+    if not okType or valueType ~= "number" then return false end
+
+    if hasanysecretvalues then
+        local okSecret, isSecret = pcall(hasanysecretvalues, value)
+        if okSecret and isSecret then return false end
+    end
+
+    local okIndex = pcall(function()
+        local probe = { [value] = true }
+        return probe[value]
+    end)
+    return okIndex
+end
+
 local function CleanNumber(value)
     if value == nil then return nil end
 
-    local okString, stringValue = pcall(tostring, value)
-    if okString and stringValue then
-        local clean = tonumber(stringValue)
-        if clean then return clean end
+    if IsCleanNumber(value) then return value end
+
+    local okDirect, direct = pcall(tonumber, value)
+    if okDirect and direct and IsCleanNumber(direct) then
+        return direct
     end
 
-    local okFormat, formatted = pcall(string.format, "%.3f", value)
+    local okFormat, formatted = pcall(string.format, "%.0f", value)
     if okFormat and formatted then
-        local clean = tonumber(formatted)
-        if clean then return clean end
+        local okClean, clean = pcall(tonumber, formatted)
+        if okClean and clean and IsCleanNumber(clean) then return clean end
+    end
+
+    local okString, stringValue = pcall(tostring, value)
+    if okString and stringValue then
+        local okClean, clean = pcall(tonumber, stringValue)
+        if okClean and clean and IsCleanNumber(clean) then return clean end
     end
 
     cleanNumberValue = nil
     pcall(cleanNumberSlider.SetValue, cleanNumberSlider, 0)
     cleanNumberValue = nil
-    pcall(cleanNumberSlider.SetValue, cleanNumberSlider, value)
+    local sliderOk = pcall(cleanNumberSlider.SetValue, cleanNumberSlider, value)
+    if sliderOk and cleanNumberValue ~= nil then
+        local okClean, clean = pcall(tonumber, cleanNumberValue)
+        if okClean and clean and IsCleanNumber(clean) then return clean end
+    end
 
-    return cleanNumberValue
+    return nil
 end
 
 local function CleanBoolean(value)
@@ -342,32 +384,6 @@ local function CleanBoolean(value)
             return false
         end)
         if okValue then return cleanValue end
-    end
-
-    return nil
-end
-
-local RAID_TARGET_FLAGS = {
-    [1] = COMBATLOG_OBJECT_RAIDTARGET1 or 0x01,
-    [2] = COMBATLOG_OBJECT_RAIDTARGET2 or 0x02,
-    [3] = COMBATLOG_OBJECT_RAIDTARGET3 or 0x04,
-    [4] = COMBATLOG_OBJECT_RAIDTARGET4 or 0x08,
-    [5] = COMBATLOG_OBJECT_RAIDTARGET5 or 0x10,
-    [6] = COMBATLOG_OBJECT_RAIDTARGET6 or 0x20,
-    [7] = COMBATLOG_OBJECT_RAIDTARGET7 or 0x40,
-    [8] = COMBATLOG_OBJECT_RAIDTARGET8 or 0x80,
-}
-
-local function RaidFlagsToMarkerIndex(raidFlags)
-    local flags = CleanNumber(raidFlags)
-    if not flags or flags <= 0 then return nil end
-
-    for markerIndex, markerFlag in ipairs(RAID_TARGET_FLAGS) do
-        if bit and bit.band then
-            if bit.band(flags, markerFlag) ~= 0 then return markerIndex end
-        elseif flags % (markerFlag * 2) >= markerFlag then
-            return markerIndex
-        end
     end
 
     return nil
@@ -457,26 +473,6 @@ local function FindMyInterrupt()
             return
         end
     end
-end
-
--------------------------------------------------------------------------------
--- Read actual cooldown from API (called after each kick to get talent/haste-
--- adjusted value). Updates mySpellCD if successful.
--------------------------------------------------------------------------------
-local function RefreshCooldownDuration()
-    if not mySpellID then return end
-    if C_Spell and C_Spell.GetSpellCooldown then
-        local ok, info = pcall(C_Spell.GetSpellCooldown, mySpellID)
-        if ok and info then
-            local okD, dur = pcall(function() return info.duration end)
-            if okD and dur and dur > 1.5 then
-                mySpellCD = dur
-                return dur
-            end
-        end
-    end
-    local canonicalID = SPELL_ALIASES[mySpellID] or mySpellID
-    return mySpellCD or (INTERRUPT_SPELLS[canonicalID] and INTERRUPT_SPELLS[canonicalID].cd) or 15
 end
 
 local function RefreshCooldownFromSpell(spellID, fallbackCd)
@@ -730,18 +726,6 @@ local function OnSpellcastSucceeded(unit, castGUID, spellID)
     TrackKickUsed(spellID, spellName, "UNIT_SPELLCAST_SUCCEEDED")
 end
 
-local RecordCombatLogCast
-
-local function OnCombatLogEvent()
-    local _, subEvent, _, sourceGUID, sourceName, _, sourceRaidFlags, _, _, _, _, spellID, spellName = CombatLogGetCurrentEventInfo()
-    if subEvent == "SPELL_CAST_START" and RecordCombatLogCast then
-        RecordCombatLogCast(sourceGUID, sourceName, sourceRaidFlags, spellID, spellName)
-    end
-    if sourceGUID == myGUID and (subEvent == "SPELL_CAST_SUCCESS" or subEvent == "SPELL_INTERRUPT") then
-        TrackKickUsed(spellID, spellName, subEvent)
-    end
-end
-
 -------------------------------------------------------------------------------
 -- Nearby Cast Tracking
 -- Mirrors TargetedSpells' reliable pattern: react to nameplate spellcast events,
@@ -760,13 +744,6 @@ end
 
 local function IsNameplateUnit(unit)
     return type(unit) == "string" and unit:match("^nameplate%d+$") ~= nil
-end
-
-local function GetUnitGUIDSafe(unit)
-    if not unit or not UnitGUID then return nil end
-    local ok, guid = pcall(UnitGUID, unit)
-    if ok then return guid end
-    return nil
 end
 
 local function UnitIsRelevantCaster(unit)
@@ -796,6 +773,29 @@ local function NormalizeSpellID(spellID)
     if cleanSpellID then
         return math.floor(cleanSpellID + 0.5)
     end
+
+    if spellID and C_Spell and C_Spell.GetBaseSpell then
+        local okBase, baseSpellID = pcall(C_Spell.GetBaseSpell, spellID)
+        cleanSpellID = okBase and CleanNumber(baseSpellID)
+        if cleanSpellID then
+            return math.floor(cleanSpellID + 0.5)
+        end
+    end
+
+    if spellID and C_Spell and C_Spell.GetSpellInfo then
+        local okInfo, info = pcall(C_Spell.GetSpellInfo, spellID)
+        if okInfo and info then
+            if type(info) == "table" then
+                cleanSpellID = CleanNumber(info.spellID or info.spellId or info.id)
+            else
+                cleanSpellID = CleanNumber(info)
+            end
+            if cleanSpellID then
+                return math.floor(cleanSpellID + 0.5)
+            end
+        end
+    end
+
     return nil
 end
 
@@ -820,14 +820,27 @@ local function SafeText(value)
     return nil
 end
 
+local function IsPresentValue(value)
+    if value then return true end
+    return false
+end
+
+local function FirstPresentValue(...)
+    for i = 1, select("#", ...) do
+        local value = select(i, ...)
+        if IsPresentValue(value) then return value end
+    end
+    return nil
+end
+
 local spellNameCache = {}
 
 local function GetRawPublicSpellName(spellID)
-    if spellID == nil then return nil end
+    if not IsPresentValue(spellID) then return nil end
 
     if C_Spell and C_Spell.GetSpellName then
         local ok, name = pcall(C_Spell.GetSpellName, spellID)
-        if ok and name then return name end
+        if ok then return name end
     end
 
     local cleanSpellID = NormalizeSpellID(spellID)
@@ -838,8 +851,16 @@ local function GetRawPublicSpellName(spellID)
     return nil
 end
 
+local function GetRawPublicSpellTexture(spellID)
+    if not IsPresentValue(spellID) or not (C_Spell and C_Spell.GetSpellTexture) then return nil end
+
+    local ok, texture = pcall(C_Spell.GetSpellTexture, spellID)
+    if ok then return texture end
+    return nil
+end
+
 local function GetPublicSpellName(spellID)
-    if spellID == nil then return nil end
+    if not IsPresentValue(spellID) then return nil end
 
     local rawName = SafeText(GetRawPublicSpellName(spellID))
     if rawName then
@@ -995,10 +1016,6 @@ local function IsPlaceholderSpellName(name)
     return not name or name == "" or name == "Unknown Spell" or name == "Spell unknown"
 end
 
-local function ApplyCombatLogMetadata(entry)
-    return false
-end
-
 local function PreserveCastMetadata(entry, existing)
     if not (entry and existing) then return end
 
@@ -1015,6 +1032,18 @@ local function PreserveCastMetadata(entry, existing)
         entry.spellID = existing.spellID or existing.cleanSpellID
     end
 
+    if not entry.eventSpellID and existing.eventSpellID then
+        entry.eventSpellID = existing.eventSpellID
+    end
+
+    if not entry.rawEventSpellID and existing.rawEventSpellID then
+        entry.rawEventSpellID = existing.rawEventSpellID
+    end
+
+    if not entry.rawUnitSpellID and existing.rawUnitSpellID then
+        entry.rawUnitSpellID = existing.rawUnitSpellID
+    end
+
     if not entry.targetName and existing.targetName then
         entry.targetName = existing.targetName
     end
@@ -1023,8 +1052,12 @@ local function PreserveCastMetadata(entry, existing)
         entry.enemyNameRaw = existing.enemyNameRaw
     end
 
-    if not entry.spellNameRaw and existing.spellNameRaw then
-        entry.spellNameRaw = existing.spellNameRaw
+    entry.spellNameRaw = FirstPresentValue(entry.spellNameRaw, existing.spellNameRaw)
+    entry.rawSpellName = FirstPresentValue(entry.rawSpellName, existing.rawSpellName)
+    entry.rawSpellTexture = FirstPresentValue(entry.rawSpellTexture, existing.rawSpellTexture)
+
+    if not entry.cleanSpellTexture and existing.cleanSpellTexture then
+        entry.cleanSpellTexture = existing.cleanSpellTexture
     end
 end
 
@@ -1081,7 +1114,6 @@ end
 function MissedKick.GetRaidMarkerForUnit(unit)
     local raw = GetRaidMarkerRaw(unit)
     local clean = GetRaidMarkerSafe(unit)
-    DebugPrint("marker lookup unit=" .. tostring(unit) .. " raw=" .. tostring(raw) .. " clean=" .. tostring(clean))
     return raw, clean
 end
 
@@ -1100,21 +1132,52 @@ local function GetDurationObject(unit, isChannel)
     return nil
 end
 
+local function StorePendingNearbyCastEvent(unit, spellID, castID, isChannel)
+    if not unit then return end
+
+    pendingNearbyCastEvents[unit] = {
+        spellID = spellID,
+        castID = castID,
+        isChannel = isChannel and true or false,
+        startTime = GetTime(),
+    }
+end
+
+local function GetPendingNearbyCastEvent(unit)
+    local pending = unit and pendingNearbyCastEvents[unit]
+    if not pending then return nil end
+
+    if (GetTime() - (pending.startTime or 0)) > PENDING_CAST_TTL then
+        pendingNearbyCastEvents[unit] = nil
+        return nil
+    end
+
+    return pending
+end
+
 local function UpsertFallbackCast(unit, eventSpellID, reason)
     if not unit or not eventSpellID then return false end
     if not IsNameplateUnit(unit) then return false end
 
     local now = GetTime()
     local cleanSpellID = NormalizeSpellID(eventSpellID)
+    local rawSpellName = GetRawPublicSpellName(eventSpellID)
+    local rawSpellTexture = GetRawPublicSpellTexture(eventSpellID)
+    local cleanSpellTexture = CleanNumber(rawSpellTexture)
     local spellName = GetPublicSpellName(eventSpellID) or ("Spell " .. tostring(cleanSpellID or "unknown"))
     local entry = {
         unit        = unit,
         enemyName   = GetUnitNameSafe(unit),
         enemyNameRaw = GetRawUnitName(unit),
         spellName   = spellName,
-        spellNameRaw = GetRawPublicSpellName(eventSpellID),
+        spellNameRaw = rawSpellName,
+        rawSpellName = rawSpellName,
+        rawSpellTexture = rawSpellTexture,
+        cleanSpellTexture = cleanSpellTexture,
         spellID     = cleanSpellID,
         cleanSpellID = cleanSpellID,
+        eventSpellID = cleanSpellID,
+        rawEventSpellID = eventSpellID,
         targetName  = nil,
         markerIndexRaw = GetRaidMarkerRaw(unit),
         markerIndex = GetRaidMarkerSafe(unit),
@@ -1137,7 +1200,7 @@ local function UpsertFallbackCast(unit, eventSpellID, reason)
                 existing.cleanSpellID = cleanSpellID
                 existing.markerIndexRaw = entry.markerIndexRaw
                 existing.markerIndex = entry.markerIndex
-                DebugPrint("cast fallback metadata kept unit=" .. tostring(unit) .. " spell=" .. tostring(existing.spellName) .. " reason=" .. tostring(reason))
+                DebugPrintThrottled("cast-fallback-" .. tostring(unit), "cast fallback metadata kept unit=" .. tostring(unit) .. " spell=" .. tostring(existing.spellName) .. " reason=" .. tostring(reason), 1.5)
                 if MissedKick_RefreshCasts then MissedKick_RefreshCasts() end
                 return true
             end
@@ -1149,19 +1212,19 @@ local function UpsertFallbackCast(unit, eventSpellID, reason)
                 existing.cleanSpellID = cleanSpellID
                 existing.markerIndexRaw = entry.markerIndexRaw
                 existing.markerIndex = entry.markerIndex
-                DebugPrint("cast fallback kept unit=" .. tostring(unit) .. " spell=" .. tostring(spellName) .. " reason=" .. tostring(reason))
+                DebugPrintThrottled("cast-fallback-" .. tostring(unit), "cast fallback kept unit=" .. tostring(unit) .. " spell=" .. tostring(spellName) .. " reason=" .. tostring(reason), 1.5)
                 if MissedKick_RefreshCasts then MissedKick_RefreshCasts() end
                 return true
             end
             nearbyCasts[i] = entry
-            DebugPrint("cast fallback updated unit=" .. tostring(unit) .. " spell=" .. tostring(spellName) .. " reason=" .. tostring(reason))
+            DebugPrintThrottled("cast-fallback-" .. tostring(unit), "cast fallback updated unit=" .. tostring(unit) .. " spell=" .. tostring(spellName) .. " reason=" .. tostring(reason), 1.5)
             if MissedKick_RefreshCasts then MissedKick_RefreshCasts() end
             return true
         end
     end
 
     nearbyCasts[#nearbyCasts + 1] = entry
-    DebugPrint("cast fallback added unit=" .. tostring(unit) .. " spell=" .. tostring(spellName) .. " reason=" .. tostring(reason))
+    DebugPrintThrottled("cast-fallback-" .. tostring(unit), "cast fallback added unit=" .. tostring(unit) .. " spell=" .. tostring(spellName) .. " reason=" .. tostring(reason), 1.5)
     if MissedKick_RefreshCasts then MissedKick_RefreshCasts() end
     return true
 end
@@ -1177,14 +1240,18 @@ local function UpsertNearbyCast(unit, eventSpellID)
         return
     end
 
-    local castName, castSpellID, castID, castNotInterruptible
-    local channelName, channelSpellID, channelCastID, channelNotInterruptible
+    local pending = GetPendingNearbyCastEvent(unit)
+    local effectiveEventSpellID = eventSpellID or (pending and pending.spellID)
+
+    local castName, castSpellID, castID, castNotInterruptible, castTexture
+    local channelName, channelSpellID, channelCastID, channelNotInterruptible, channelTexture
     local isCasting = false
     local isChanneling = false
 
     local ok1, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10 = pcall(UnitCastingInfo, unit)
     if ok1 and c1 then
         castName = c1
+        castTexture = c3
         castNotInterruptible = c8
         castSpellID = c9
         castID = c10
@@ -1195,6 +1262,7 @@ local function UpsertNearbyCast(unit, eventSpellID)
         local ok2, ch1, ch2, ch3, ch4, ch5, ch6, ch7, ch8, ch9, ch10, ch11 = pcall(UnitChannelInfo, unit)
         if ok2 and ch1 then
             channelName = ch1
+            channelTexture = ch3
             channelNotInterruptible = ch7
             channelSpellID = ch8
             channelCastID = ch11
@@ -1203,8 +1271,8 @@ local function UpsertNearbyCast(unit, eventSpellID)
     end
 
     if not (isCasting or isChanneling) then
-        if eventSpellID then
-            UpsertFallbackCast(unit, eventSpellID, "event-only")
+        if effectiveEventSpellID then
+            UpsertFallbackCast(unit, effectiveEventSpellID, "event-only")
             return
         end
         ClearNearbyCast(unit)
@@ -1213,16 +1281,16 @@ local function UpsertNearbyCast(unit, eventSpellID)
 
     local durationObject = GetDurationObject(unit, isChanneling)
     if not durationObject then
-        if eventSpellID then
-            UpsertFallbackCast(unit, eventSpellID, "no-duration")
+        if effectiveEventSpellID then
+            UpsertFallbackCast(unit, effectiveEventSpellID, "no-duration")
         end
         return
     end
 
     local spellName = isCasting and castName or channelName
-    local spellID   = isCasting and castSpellID or channelSpellID
-    spellID = spellID or eventSpellID
-    local cleanSpellID = NormalizeSpellID(spellID)
+    local unitSpellID = isCasting and castSpellID or channelSpellID
+    local eventCleanSpellID = NormalizeSpellID(effectiveEventSpellID)
+    local cleanSpellID = eventCleanSpellID or NormalizeSpellID(unitSpellID)
     if not cleanSpellID then
         for _, existing in ipairs(nearbyCasts) do
             if existing.unit == unit and existing.cleanSpellID then
@@ -1231,7 +1299,20 @@ local function UpsertNearbyCast(unit, eventSpellID)
             end
         end
     end
-    spellName = SafeText(spellName) or GetPublicSpellName(spellID) or GetPublicSpellName(cleanSpellID) or "Unknown Spell"
+    local rawSpellName = FirstPresentValue(
+        spellName,
+        GetRawPublicSpellName(effectiveEventSpellID),
+        GetRawPublicSpellName(unitSpellID),
+        GetRawPublicSpellName(eventCleanSpellID)
+    )
+    local rawSpellTexture = FirstPresentValue(
+        isCasting and castTexture or channelTexture,
+        GetRawPublicSpellTexture(effectiveEventSpellID),
+        GetRawPublicSpellTexture(unitSpellID),
+        GetRawPublicSpellTexture(eventCleanSpellID)
+    )
+    local cleanSpellTexture = CleanNumber(rawSpellTexture)
+    spellName = SafeText(spellName) or GetPublicSpellName(effectiveEventSpellID) or GetPublicSpellName(eventCleanSpellID) or GetPublicSpellName(unitSpellID) or GetPublicSpellName(cleanSpellID) or "Unknown Spell"
     local notInterruptibleRaw
     if isCasting then
         notInterruptibleRaw = castNotInterruptible
@@ -1239,20 +1320,27 @@ local function UpsertNearbyCast(unit, eventSpellID)
         notInterruptibleRaw = channelNotInterruptible
     end
     local notInterruptible = CleanBoolean(notInterruptibleRaw)
-    local entryCastID = isCasting and castID or channelCastID
+    local entryCastID = (isCasting and castID or channelCastID) or (pending and pending.castID)
+    local entryStartTime = (pending and pending.startTime) or GetTime()
 
     local entry = {
         unit        = unit,
         enemyName   = GetUnitNameSafe(unit),
         enemyNameRaw = GetRawUnitName(unit),
         spellName   = spellName,
-        spellNameRaw = (isCasting and castName or channelName) or GetRawPublicSpellName(spellID),
+        spellNameRaw = rawSpellName,
+        rawSpellName = rawSpellName,
+        rawSpellTexture = rawSpellTexture,
+        cleanSpellTexture = cleanSpellTexture,
         spellID     = cleanSpellID,
         cleanSpellID = cleanSpellID,
+        eventSpellID = eventCleanSpellID,
+        rawEventSpellID = effectiveEventSpellID,
+        rawUnitSpellID = unitSpellID,
         targetName  = GetCastTargetName(unit),
         markerIndexRaw = GetRaidMarkerRaw(unit),
         markerIndex = GetRaidMarkerSafe(unit),
-        startTime   = GetTime(),
+        startTime   = entryStartTime,
         durationObject = durationObject,
         isChannel   = isChanneling,
         castID      = entryCastID,
@@ -1271,14 +1359,20 @@ local function UpsertNearbyCast(unit, eventSpellID)
                 entry.castID = existing.castID
             end
             nearbyCasts[i] = entry
-            DebugPrint("cast updated unit=" .. tostring(unit) .. " spell=" .. tostring(entry.spellName))
+            DebugPrintThrottled("cast-live-" .. tostring(unit), "cast live unit=" .. tostring(unit)
+                .. " spell=" .. tostring(entry.spellName)
+                .. " cleanID=" .. tostring(entry.cleanSpellID)
+                .. " texture=" .. tostring(entry.cleanSpellTexture), 1.5)
             if MissedKick_RefreshCasts then MissedKick_RefreshCasts() end
             return
         end
     end
 
     nearbyCasts[#nearbyCasts + 1] = entry
-    DebugPrint("cast added unit=" .. tostring(unit) .. " spell=" .. tostring(entry.spellName))
+    DebugPrintThrottled("cast-live-" .. tostring(unit), "cast live unit=" .. tostring(unit)
+        .. " spell=" .. tostring(entry.spellName)
+        .. " cleanID=" .. tostring(entry.cleanSpellID)
+        .. " texture=" .. tostring(entry.cleanSpellTexture), 1.5)
     if MissedKick_RefreshCasts then MissedKick_RefreshCasts() end
 end
 
@@ -1290,9 +1384,28 @@ local function SafeUpsertNearbyCast(unit, spellID)
     end
 end
 
-local function ScheduleNearbyCastUpdate(unit, spellID)
+local function IsDungeonInstanceActive()
+    if IsInInstance then
+        local ok, inInstance, instanceType = pcall(IsInInstance)
+        return ok and inInstance and instanceType == "party" or false
+    end
+    return false
+end
+
+local function ShouldScanNearbyCasts()
+    local activeDB = db or MissedKickDB
+    if activeDB and activeDB.nearbyCastsEnabled == false then return false end
+    if activeDB and activeDB.onlyDungeons == true and not IsDungeonInstanceActive() then return false end
+    return true
+end
+
+local function ScheduleNearbyCastUpdate(unit, spellID, castID, isChannel, fromSpellcastEvent)
+    if not ShouldScanNearbyCasts() then return end
     if not unit then return end
-    DebugPrint("cast event unit=" .. tostring(unit) .. " spellID=" .. tostring(spellID))
+    if fromSpellcastEvent then
+        StorePendingNearbyCastEvent(unit, spellID, castID, isChannel)
+    end
+    DebugPrintThrottled("cast-event-" .. tostring(unit), "cast event unit=" .. tostring(unit) .. " spellID=" .. tostring(spellID), 1.5)
     if spellID then
         pcall(UpsertFallbackCast, unit, spellID, "event")
     else
@@ -1301,25 +1414,72 @@ local function ScheduleNearbyCastUpdate(unit, spellID)
     C_Timer.After(0.20, function() SafeUpsertNearbyCast(unit, spellID) end)
 end
 
+local function HasTrackedNearbyCast(unit)
+    for _, cast in ipairs(nearbyCasts) do
+        if cast.unit == unit then return true end
+    end
+    return false
+end
+
+local function UnitHasLiveCast(unit)
+    if not unit or not UnitExists(unit) then return false end
+
+    local hasCast = false
+    pcall(function()
+        if UnitCastingInfo(unit) then
+            hasCast = true
+        end
+    end)
+    if hasCast then return true end
+
+    pcall(function()
+        if UnitChannelInfo(unit) then
+            hasCast = true
+        end
+    end)
+    return hasCast
+end
+
 local function ScanNearbyCasts()
     if testCastsUntil > GetTime() then return end
+    if not ShouldScanNearbyCasts() then return end
 
     local now = GetTime()
     local markerChanged = false
+    for _, unit in ipairs(NAMEPLATE_UNITS) do
+        if UnitHasLiveCast(unit) and not HasTrackedNearbyCast(unit) then
+            SafeUpsertNearbyCast(unit)
+        end
+    end
+
     for i = #nearbyCasts, 1, -1 do
         if nearbyCasts[i].fallback and (nearbyCasts[i].endTime or 0) <= now then
             table.remove(nearbyCasts, i)
+            markerChanged = true
         elseif nearbyCasts[i].unit and UnitExists(nearbyCasts[i].unit) then
-            local markerRaw = GetRaidMarkerRaw(nearbyCasts[i].unit)
-            local markerIndex = GetRaidMarkerSafe(nearbyCasts[i].unit)
-            local rawPresenceChanged = MarkerPresenceChanged(nearbyCasts[i].markerIndexRaw, markerRaw)
-            if nearbyCasts[i].markerIndex ~= markerIndex or rawPresenceChanged then
-                nearbyCasts[i].markerIndexRaw = markerRaw
-                nearbyCasts[i].markerIndex = markerIndex
+            if not nearbyCasts[i].fallback and not UnitHasLiveCast(nearbyCasts[i].unit) then
+                table.remove(nearbyCasts, i)
                 markerChanged = true
             else
-                nearbyCasts[i].markerIndexRaw = markerRaw
+                local markerRaw = GetRaidMarkerRaw(nearbyCasts[i].unit)
+                local markerIndex = GetRaidMarkerSafe(nearbyCasts[i].unit)
+                local targetName = GetCastTargetName(nearbyCasts[i].unit)
+                local rawPresenceChanged = MarkerPresenceChanged(nearbyCasts[i].markerIndexRaw, markerRaw)
+                if nearbyCasts[i].markerIndex ~= markerIndex or rawPresenceChanged then
+                    nearbyCasts[i].markerIndexRaw = markerRaw
+                    nearbyCasts[i].markerIndex = markerIndex
+                    markerChanged = true
+                else
+                    nearbyCasts[i].markerIndexRaw = markerRaw
+                end
+                if nearbyCasts[i].targetName ~= targetName then
+                    nearbyCasts[i].targetName = targetName
+                    markerChanged = true
+                end
             end
+        elseif not nearbyCasts[i].fallback then
+            table.remove(nearbyCasts, i)
+            markerChanged = true
         end
     end
 
@@ -1328,49 +1488,6 @@ local function ScanNearbyCasts()
     end
 end
 MissedKick.ScanNearbyCasts = ScanNearbyCasts
-
--------------------------------------------------------------------------------
--- Dangerous Cast Checking
--- Returns: isDangerous, isYourKick
--------------------------------------------------------------------------------
-function MissedKick.IsDangerousCast(spellID, spellName, markerIndex)
-    if not db then return false, false end
-    local isDangerous = false
-
-    -- Check by spell ID first (preferred)
-    local cleanSpellID = CleanNumber(spellID)
-    if cleanSpellID then
-        cleanSpellID = math.floor(cleanSpellID + 0.5)
-    end
-    local okID, idHit = pcall(function()
-        return cleanSpellID and db.dangerousCasts[cleanSpellID]
-    end)
-    if okID and idHit then
-        isDangerous = true
-    end
-
-    -- Check by spell name as fallback
-    if not isDangerous and spellName then
-        local okName, nameHit = pcall(function()
-            return db.dangerousCasts[spellName]
-        end)
-        if okName and nameHit then
-            isDangerous = true
-        end
-    end
-
-    -- Check if this is YOUR KICK (dangerous + matching marker)
-    local isYourKick = false
-    if isDangerous and db.myMarker ~= "none" then
-        local myMarkerIdx = MARKER_NAMES[db.myMarker]
-        local cleanMarkerIndex = CleanNumber(markerIndex)
-        if myMarkerIdx and myMarkerIdx > 0 and cleanMarkerIndex == myMarkerIdx then
-            isYourKick = true
-        end
-    end
-
-    return isDangerous, isYourKick
-end
 
 -------------------------------------------------------------------------------
 -- Test Mode: populate fake data for UI testing
@@ -1409,7 +1526,7 @@ local function PopulateTestData()
     for i = #nearbyCasts, 1, -1 do nearbyCasts[i] = nil end
     nearbyCasts[1] = {
         unit = "nameplate1", enemyName = "Vile Caster",
-        spellName = "Shadow Bolt", spellID = 686,
+        spellName = "Repel", spellID = 1255377, cleanSpellID = 1255377,
         targetName = "Smashface", markerIndex = 8,
         startTime = GetTime(), endTime = GetTime() + 5, duration = 5,
     }
@@ -1457,32 +1574,21 @@ local function HandleSlash(msg)
     cmd = (cmd or ""):lower()
     arg = (arg or ""):lower()
 
-    if cmd == "" or cmd == "menu" or cmd == "settings" or cmd == "config" then
-        if MissedKick_ToggleSettings then MissedKick_ToggleSettings() end
-
-    elseif cmd == "help" then
+    if cmd == "help" then
         Print("|cffffffccCommands:|r")
-        Print("  /mk - Open settings menu")
-        Print("  /mk show - Show tracker")
-        Print("  /mk hide - Hide tracker")
+        Print("  /mk help - Show this command list")
+        Print("  /mk menu - Open settings menu")
         Print("  /mk center - Move tracker to screen center")
         Print("  /mk test - Populate test data")
         Print("  /mk reset - Clear all cooldowns")
         Print("  /mk debug - Toggle debug logging")
         Print("  /mk fakeparty - Simulate a party member kick")
         Print("  /mk version - Show loaded build")
-        Print("  /mk marker <name> - Set raid marker")
-        Print("  /mk dangerous add <id or name>")
-        Print("  /mk dangerous remove <id or name>")
-        Print("  /mk dangerous list")
 
-    elseif cmd == "show" then
-        if MissedKick_ShowFrame then MissedKick_ShowFrame() end
+    elseif cmd == "menu" then
+        if MissedKick_ToggleSettings then MissedKick_ToggleSettings() end
 
-    elseif cmd == "hide" then
-        if MissedKick_HideFrame then MissedKick_HideFrame() end
-
-    elseif cmd == "center" or cmd == "centre" or cmd == "resetpos" then
+    elseif cmd == "center" then
         if MissedKick_CenterFrame then MissedKick_CenterFrame() end
 
     elseif cmd == "test" then
@@ -1499,84 +1605,11 @@ local function HandleSlash(msg)
     elseif cmd == "version" then
         Print("Build |cffffcc00" .. ADDON_BUILD .. "|r")
 
-    elseif cmd == "fakekick" then
-        local spellID = mySpellID or 106839
-        local spellName = INTERRUPT_SPELLS[spellID] and INTERRUPT_SPELLS[spellID].name or "Skull Bash"
-        TrackKickUsed(spellID, spellName, "fakekick")
-        Print("Forced local kick cooldown for UI test.")
-
     elseif cmd == "fakeparty" then
         SimulatePartyKick()
 
-    elseif cmd == "marker" then
-        if arg == "" then
-            local current = db and db.myMarker or "none"
-            Print("Current marker: |cffffcc00" .. current .. "|r")
-            Print("Usage: /mk marker <star|circle|diamond|triangle|moon|square|cross|skull|none>")
-            return
-        end
-        if MARKER_NAMES[arg] ~= nil then
-            db.myMarker = arg
-            if arg == "none" then
-                Print("Marker assignment |cff888888cleared|r.")
-            else
-                Print("Marker set to |cffffcc00" .. arg .. "|r. Dangerous casts on this target will show as YOUR KICK.")
-            end
-            if MissedKick_RefreshUI then MissedKick_RefreshUI() end
-        else
-            Print("|cffff0000Unknown marker:|r " .. arg)
-            Print("Valid: star, circle, diamond, triangle, moon, square, cross, skull, none")
-        end
-
-    elseif cmd == "dangerous" then
-        local subcmd, subarg = arg:match("^(%S+)%s*(.*)$")
-        subcmd = (subcmd or ""):lower()
-
-        if subcmd == "add" and subarg and subarg ~= "" then
-            local numID = tonumber(subarg)
-            if numID then
-                db.dangerousCasts[numID] = true
-                Print("Added dangerous cast: spell ID |cffffcc00" .. numID .. "|r")
-            else
-                -- Store by name (original case from user input)
-                local originalArg = msg:match("^%S+%s+%S+%s+(.+)$") or subarg
-                db.dangerousCasts[originalArg] = true
-                Print("Added dangerous cast: |cffffcc00" .. originalArg .. "|r")
-            end
-
-        elseif subcmd == "remove" and subarg and subarg ~= "" then
-            local numID = tonumber(subarg)
-            if numID then
-                db.dangerousCasts[numID] = nil
-                Print("Removed dangerous cast: spell ID |cffffcc00" .. numID .. "|r")
-            else
-                local originalArg = msg:match("^%S+%s+%S+%s+(.+)$") or subarg
-                db.dangerousCasts[originalArg] = nil
-                Print("Removed dangerous cast: |cffffcc00" .. originalArg .. "|r")
-            end
-
-        elseif subcmd == "list" then
-            local count = 0
-            for key, _ in pairs(db.dangerousCasts) do
-                if type(key) == "number" then
-                    Print("  Spell ID: |cffffcc00" .. key .. "|r")
-                else
-                    Print("  Spell Name: |cffffcc00" .. key .. "|r")
-                end
-                count = count + 1
-            end
-            if count == 0 then
-                Print("|cff888888No dangerous casts configured.|r Use /mk dangerous add <spellID or name>")
-            else
-                Print(count .. " dangerous cast(s) configured.")
-            end
-
-        else
-            Print("Usage: /mk dangerous <add|remove|list> [spellID or name]")
-        end
-
     else
-        Print("|cffff0000Unknown command:|r " .. cmd .. ". Type |cff88ccff/mk help|r for options.")
+        Print("|cffff0000Unknown command.|r Type |cff88ccff/mk help|r for options.")
     end
 end
 
@@ -1599,10 +1632,6 @@ end)
 
 local eventFrame = CreateFrame("Frame")
 local castScanTimer = 0
-local NAMEPLATE_UNITS = {}
-for i = 1, 40 do
-    NAMEPLATE_UNITS[i] = "nameplate" .. i
-end
 
 local function RegisterNameplateUnitEvent(frame, eventName)
     if unpack then
@@ -1618,6 +1647,8 @@ RegisterNameplateUnitEvent(eventFrame, "UNIT_TARGET")
 RegisterNameplateUnitEvent(eventFrame, "UNIT_SPELLCAST_START")
 RegisterNameplateUnitEvent(eventFrame, "UNIT_SPELLCAST_CHANNEL_START")
 RegisterNameplateUnitEvent(eventFrame, "UNIT_SPELLCAST_EMPOWER_START")
+RegisterNameplateUnitEvent(eventFrame, "UNIT_SPELLCAST_INTERRUPTIBLE")
+RegisterNameplateUnitEvent(eventFrame, "UNIT_SPELLCAST_NOT_INTERRUPTIBLE")
 RegisterNameplateUnitEvent(eventFrame, "UNIT_SPELLCAST_STOP")
 RegisterNameplateUnitEvent(eventFrame, "UNIT_SPELLCAST_CHANNEL_STOP")
 RegisterNameplateUnitEvent(eventFrame, "UNIT_SPELLCAST_EMPOWER_STOP")
@@ -1628,9 +1659,16 @@ eventFrame:RegisterEvent("RAID_TARGET_UPDATE")
 eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
 eventFrame:RegisterEvent("CHAT_MSG_ADDON")
 eventFrame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
+eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+eventFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 
 eventFrame:SetScript("OnUpdate", function(_, elapsed)
     if testCastsUntil > GetTime() then return end
+    if not ShouldScanNearbyCasts() then
+        castScanTimer = 0
+        return
+    end
     castScanTimer = castScanTimer + elapsed
     if castScanTimer >= 0.2 then
         castScanTimer = 0
@@ -1706,15 +1744,22 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         if not ok then
             Print("|cffff0000World entry error:|r " .. tostring(err))
         end
+        if MissedKick_RefreshUI then MissedKick_RefreshUI() end
 
     elseif event == "UNIT_SPELLCAST_START"
         or event == "UNIT_SPELLCAST_CHANNEL_START"
         or event == "UNIT_SPELLCAST_EMPOWER_START" then
-        local unit, castGUID, spellID = ...
+        local unit, castGUID, spellID, castID = ...
+        local isChannel = event == "UNIT_SPELLCAST_CHANNEL_START"
         if event == "UNIT_SPELLCAST_EMPOWER_START" then
-            spellID = select(3, ...)
+            spellID, castID = select(3, ...)
         end
-        ScheduleNearbyCastUpdate(unit, spellID)
+        ScheduleNearbyCastUpdate(unit, spellID, castID, isChannel, true)
+
+    elseif event == "UNIT_SPELLCAST_INTERRUPTIBLE"
+        or event == "UNIT_SPELLCAST_NOT_INTERRUPTIBLE" then
+        local unit = ...
+        ScheduleNearbyCastUpdate(unit)
 
     elseif event == "UNIT_TARGET"
         or event == "NAME_PLATE_UNIT_ADDED" then
@@ -1733,6 +1778,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
 
     elseif event == "GROUP_ROSTER_UPDATE" then
         ScheduleRosterRebuild()
+        if MissedKick_RefreshUI then MissedKick_RefreshUI() end
 
     elseif event == "CHAT_MSG_ADDON" then
         OnAddonMessage(...)
@@ -1740,5 +1786,11 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
     elseif event == "PLAYER_SPECIALIZATION_CHANGED" then
         pcall(FindMyInterrupt)
         pcall(RebuildPartyRoster)
+        if MissedKick_RefreshUI then MissedKick_RefreshUI() end
+
+    elseif event == "PLAYER_REGEN_DISABLED"
+        or event == "PLAYER_REGEN_ENABLED"
+        or event == "ZONE_CHANGED_NEW_AREA" then
+        if MissedKick_RefreshUI then MissedKick_RefreshUI() end
     end
 end)

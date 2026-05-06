@@ -11,6 +11,14 @@ local ICON_SZ        = 18
 local CAST_SCAN_RATE = 0.2
 local CD_UPDATE_RATE = 0.1
 
+local CAST_TARGET_R, CAST_TARGET_G, CAST_TARGET_B, CAST_TARGET_A = 0.58, 0.17, 0.12, 0.9
+local CAST_OTHER_R,  CAST_OTHER_G,  CAST_OTHER_B,  CAST_OTHER_A  = 0.58, 0.58, 0.62, 0.86
+local CAST_OUTLINE_INSET = 2
+local CAST_TEXT_NORMAL_R,    CAST_TEXT_NORMAL_G,    CAST_TEXT_NORMAL_B    = 0.92, 0.92, 0.92
+local CAST_TEXT_IMPORTANT_R, CAST_TEXT_IMPORTANT_G, CAST_TEXT_IMPORTANT_B = 1.00, 0.84, 0.32
+local CAST_SEP_NORMAL_R,     CAST_SEP_NORMAL_G,     CAST_SEP_NORMAL_B     = 0.68, 0.68, 0.68
+local CAST_SEP_IMPORTANT_R,  CAST_SEP_IMPORTANT_G,  CAST_SEP_IMPORTANT_B  = 1.00, 0.72, 0.20
+
 local MARKER_OUTLINE_TEXTURES = {
     [1] = "Interface\\AddOns\\MissedKick\\Textures\\MarkerOutline_1.png",
     [2] = "Interface\\AddOns\\MissedKick\\Textures\\MarkerOutline_2.png",
@@ -51,6 +59,62 @@ local function GetDB()
         if db then return db end
     end
     return MissedKickDB
+end
+
+local function IsKickTrackerEnabled()
+    local db = GetDB()
+    return not db or db.kickTrackerEnabled ~= false
+end
+
+local function IsNearbyCastsEnabled()
+    local db = GetDB()
+    return not db or db.nearbyCastsEnabled ~= false
+end
+
+local function SetKickTrackerEnabled(enabled)
+    local db = GetDB() or MissedKickDB or {}
+    MissedKickDB = db
+    db.kickTrackerEnabled = enabled and true or false
+end
+
+local function SetNearbyCastsEnabled(enabled)
+    local db = GetDB() or MissedKickDB or {}
+    MissedKickDB = db
+    db.nearbyCastsEnabled = enabled and true or false
+end
+
+local function IsDungeonLoadMode()
+    local db = GetDB()
+    return db and db.onlyDungeons == true or false
+end
+
+local function SetDungeonLoadMode(enabled)
+    local db = GetDB() or MissedKickDB or {}
+    MissedKickDB = db
+    db.onlyDungeons = enabled and true or false
+end
+
+local function IsInDungeonInstance()
+    if IsInInstance then
+        local ok, inInstance, instanceType = pcall(IsInInstance)
+        return ok and inInstance and instanceType == "party" or false
+    end
+    return false
+end
+
+local function PassesLoadMode()
+    if IsDungeonLoadMode() then
+        return IsInDungeonInstance()
+    end
+    return true
+end
+
+local function IsKickTrackerVisibleByRules()
+    return IsKickTrackerEnabled() and PassesLoadMode()
+end
+
+local function IsNearbyCastsVisibleByRules()
+    return IsNearbyCastsEnabled() and PassesLoadMode()
 end
 
 local function PositionCastFrame(forceDefault)
@@ -170,12 +234,22 @@ local function GetKickRow(parent, i)
     kickRows[i] = row; return row
 end
 
+local function SetCastFillBounds(row, inset)
+    row.fill:ClearAllPoints()
+    if inset and inset > 0 then
+        row.fill:SetPoint("TOPLEFT", row, "TOPLEFT", inset, -inset)
+        row.fill:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -inset, inset)
+    else
+        row.fill:SetAllPoints(row)
+    end
+end
+
 local function GetCastRow(parent, i)
     if castRows[i] then return castRows[i] end
     local row = CreateFrame("Frame", nil, parent); row:SetHeight(BAR_HEIGHT)
     row.bg = row:CreateTexture(nil, "BACKGROUND"); row.bg:SetAllPoints(); row.bg:SetColorTexture(0.05,0.05,0.07,0.82)
     row.fill = CreateFrame("StatusBar", nil, row)
-    row.fill:SetAllPoints()
+    SetCastFillBounds(row, 0)
     row.fill:SetMinMaxValues(0, 1)
     row.fill:SetValue(0)
     row.fill:SetStatusBarTexture("Interface\\Buttons\\WHITE8x8")
@@ -185,14 +259,16 @@ local function GetCastRow(parent, i)
     row.textLayer:SetAllPoints()
     row.textLayer:SetFrameLevel(row.fill:GetFrameLevel() + 2)
     row.marker = row.textLayer:CreateTexture(nil, "ARTWORK"); row.marker:SetSize(ICON_SZ,ICON_SZ); row.marker:SetPoint("RIGHT",-6,0); row.marker:SetTexture("Interface\\TargetingFrame\\UI-RaidTargetingIcons")
-    row.text = row.textLayer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row.text:SetPoint("LEFT", row.marker, "RIGHT", 4, 0); row.text:SetPoint("RIGHT",-6,0); row.text:SetJustifyH("LEFT"); row.text:SetWordWrap(false)
     row.prefix = row.textLayer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     row.enemy = row.textLayer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     row.sep = row.textLayer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     row.spell = row.textLayer:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     row.prefix:SetJustifyH("LEFT"); row.enemy:SetJustifyH("LEFT"); row.sep:SetJustifyH("CENTER"); row.spell:SetJustifyH("LEFT")
     row.prefix:SetWordWrap(false); row.enemy:SetWordWrap(false); row.sep:SetWordWrap(false); row.spell:SetWordWrap(false)
+    for _, fs in ipairs({ row.prefix, row.enemy, row.sep, row.spell }) do
+        fs:SetShadowColor(0, 0, 0, 1)
+        fs:SetShadowOffset(1, -1)
+    end
     row.borderTop = row.textLayer:CreateTexture(nil, "OVERLAY")
     row.borderBottom = row.textLayer:CreateTexture(nil, "OVERLAY")
     row.borderLeft = row.textLayer:CreateTexture(nil, "OVERLAY")
@@ -224,17 +300,43 @@ local function SetFontTextSafe(fontString, value, fallback)
     end
 end
 
-local function SetCastText(row, c, prefixText, r, g, b)
-    row.text:Hide()
+local function SecretSafeIsNil(value)
+    return not value
+end
 
+local function FirstPresentValue(...)
+    for i = 1, select("#", ...) do
+        local value = select(i, ...)
+        if not SecretSafeIsNil(value) then
+            return value
+        end
+    end
+    return nil
+end
+
+local function SetSpellTextFromRawID(fontString, spellID)
+    if SecretSafeIsNil(spellID) or not (C_Spell and C_Spell.GetSpellName) then
+        return false
+    end
+
+    return pcall(function()
+        local spellName = C_Spell.GetSpellName(spellID)
+        if spellName == nil then error("missing spell name") end
+        fontString:SetText(spellName)
+    end)
+end
+
+local function SetCastText(row, c, prefixText, r, g, b, sepR, sepG, sepB)
     SetFontTextSafe(row.prefix, prefixText or "", "")
-    SetFontTextSafe(row.enemy, c.enemyNameRaw or c.enemyName, c.enemyName or "Unknown Enemy")
+    SetFontTextSafe(row.enemy, FirstPresentValue(c.enemyNameRaw, c.enemyName), c.enemyName or "Unknown Enemy")
     row.sep:SetText("-")
-    SetFontTextSafe(row.spell, c.spellNameRaw or c.spellName, c.spellName or "Unknown Spell")
+    if not (SetSpellTextFromRawID(row.spell, c.rawUnitSpellID) or SetSpellTextFromRawID(row.spell, c.rawEventSpellID)) then
+        SetFontTextSafe(row.spell, FirstPresentValue(c.rawSpellName, c.spellNameRaw, c.spellName), c.spellName or "Unknown Spell")
+    end
 
     row.prefix:SetTextColor(r, g, b)
     row.enemy:SetTextColor(r, g, b)
-    row.sep:SetTextColor(0.68, 0.68, 0.68)
+    row.sep:SetTextColor(sepR or CAST_SEP_NORMAL_R, sepG or CAST_SEP_NORMAL_G, sepB or CAST_SEP_NORMAL_B)
     row.spell:SetTextColor(r, g, b)
 
     row.prefix:Show()
@@ -266,6 +368,173 @@ local function SetCastFillColor(row, r, g, b, a)
     end
 end
 
+local function IsCastTargetingPlayerByName(c)
+    if not (c and c.targetName) then return false end
+
+    local myName = MissedKick and MissedKick.GetMyName and MissedKick.GetMyName() or UnitName("player")
+    if not myName then return false end
+
+    local ok, matches = pcall(function()
+        if c.targetName == myName then return true end
+        if Ambiguate then
+            return Ambiguate(c.targetName, "none") == Ambiguate(myName, "none")
+        end
+        return false
+    end)
+
+    return ok and matches or false
+end
+
+local function IsCastTargetingPlayerByUnit(c)
+    if not (c and c.unit and UnitIsUnit) then return false end
+
+    local targetsPlayer = false
+    local ok = pcall(function()
+        if UnitIsUnit(c.unit .. "target", "player") then
+            targetsPlayer = true
+        end
+    end)
+
+    return ok and targetsPlayer or false
+end
+
+local function SetCastFillColorForTarget(row, c)
+    if IsCastTargetingPlayerByName(c) or IsCastTargetingPlayerByUnit(c) then
+        SetCastFillColor(row, CAST_TARGET_R, CAST_TARGET_G, CAST_TARGET_B, CAST_TARGET_A)
+        return
+    end
+
+    if c and c.unit and PlayerIsSpellTarget and C_CurveUtil and C_CurveUtil.EvaluateColorValueFromBoolean then
+        local okState, targetsPlayer = pcall(PlayerIsSpellTarget, c.unit, "player")
+        if okState then
+            local okColor = pcall(function()
+                row.fill:SetStatusBarColor(
+                    C_CurveUtil.EvaluateColorValueFromBoolean(targetsPlayer, CAST_TARGET_R, CAST_OTHER_R),
+                    C_CurveUtil.EvaluateColorValueFromBoolean(targetsPlayer, CAST_TARGET_G, CAST_OTHER_G),
+                    C_CurveUtil.EvaluateColorValueFromBoolean(targetsPlayer, CAST_TARGET_B, CAST_OTHER_B),
+                    C_CurveUtil.EvaluateColorValueFromBoolean(targetsPlayer, CAST_TARGET_A, CAST_OTHER_A)
+                )
+            end)
+            if okColor then return end
+        end
+    end
+
+    SetCastFillColor(row, CAST_OTHER_R, CAST_OTHER_G, CAST_OTHER_B, CAST_OTHER_A)
+end
+
+local function IsSecretValue(value)
+    if hasanysecretvalues then
+        local okSecret, isSecret = pcall(hasanysecretvalues, value)
+        return okSecret and isSecret or false
+    end
+    return false
+end
+
+local function CleanLocalNumber(value)
+    if value == nil then return nil end
+    if IsSecretValue(value) then return nil end
+
+    local okType, valueType = pcall(type, value)
+    if okType and valueType == "number" then
+        local okIndex = pcall(function()
+            local probe = { [value] = true }
+            return probe[value]
+        end)
+        if okIndex then return value end
+    end
+
+    local okText, text = pcall(tostring, value)
+    if okText and text and not IsSecretValue(text) then
+        local okNumber, clean = pcall(tonumber, text)
+        if okNumber and clean then return clean end
+    end
+
+    return nil
+end
+
+local function CleanLocalText(value)
+    if value == nil then return nil end
+    if IsSecretValue(value) then return nil end
+
+    local okText, text = pcall(tostring, value)
+    if not okText or not text or IsSecretValue(text) then return nil end
+
+    local okTrim, cleanText = pcall(function()
+        return text:gsub("^%s+", ""):gsub("%s+$", "")
+    end)
+    if not okTrim or not cleanText or IsSecretValue(cleanText) then return nil end
+
+    text = cleanText
+    if text == "" then return nil end
+    return text
+end
+
+local function GetDisplayedSpellNameCandidate(row)
+    if not (row and row.spell and row.spell.GetText) then return nil end
+
+    local okText, text = pcall(row.spell.GetText, row.spell)
+    if okText then return text end
+    return nil
+end
+
+local function ApplySecretImportantPredicate(predicate, textR, textG, textB, sepR, sepG, sepB)
+    if not (C_CurveUtil and C_CurveUtil.EvaluateColorValueFromBoolean) then
+        return false, textR, textG, textB, sepR, sepG, sepB
+    end
+
+    local okColor, nextTextR, nextTextG, nextTextB, nextSepR, nextSepG, nextSepB = pcall(function()
+        local importantSpell = predicate()
+        return
+            C_CurveUtil.EvaluateColorValueFromBoolean(importantSpell, CAST_TEXT_IMPORTANT_R, textR),
+            C_CurveUtil.EvaluateColorValueFromBoolean(importantSpell, CAST_TEXT_IMPORTANT_G, textG),
+            C_CurveUtil.EvaluateColorValueFromBoolean(importantSpell, CAST_TEXT_IMPORTANT_B, textB),
+            C_CurveUtil.EvaluateColorValueFromBoolean(importantSpell, CAST_SEP_IMPORTANT_R, sepR),
+            C_CurveUtil.EvaluateColorValueFromBoolean(importantSpell, CAST_SEP_IMPORTANT_G, sepG),
+            C_CurveUtil.EvaluateColorValueFromBoolean(importantSpell, CAST_SEP_IMPORTANT_B, sepB)
+    end)
+
+    if okColor then
+        return true, nextTextR, nextTextG, nextTextB, nextSepR, nextSepG, nextSepB
+    end
+
+    return false, textR, textG, textB, sepR, sepG, sepB
+end
+
+local function ApplyImportantSpellTextColor(row, c)
+    if not (C_CurveUtil and C_CurveUtil.EvaluateColorValueFromBoolean) then
+        return false, false
+    end
+
+    local textR, textG, textB = CAST_TEXT_NORMAL_R, CAST_TEXT_NORMAL_G, CAST_TEXT_NORMAL_B
+    local sepR, sepG, sepB = CAST_SEP_NORMAL_R, CAST_SEP_NORMAL_G, CAST_SEP_NORMAL_B
+    local attempted = false
+    local importantAttempted = false
+    local rawFields = { "rawEventSpellID", "rawUnitSpellID" }
+
+    if C_Spell and C_Spell.IsSpellImportant then
+        for _, field in ipairs(rawFields) do
+            local rawSpellID = c[field]
+            local okColor, nextTextR, nextTextG, nextTextB, nextSepR, nextSepG, nextSepB =
+                ApplySecretImportantPredicate(function() return C_Spell.IsSpellImportant(rawSpellID) end, textR, textG, textB, sepR, sepG, sepB)
+            if okColor then
+                textR, textG, textB = nextTextR, nextTextG, nextTextB
+                sepR, sepG, sepB = nextSepR, nextSepG, nextSepB
+                attempted = true
+                importantAttempted = true
+            end
+        end
+    end
+
+    if attempted then
+        pcall(row.prefix.SetTextColor, row.prefix, textR, textG, textB)
+        pcall(row.enemy.SetTextColor, row.enemy, textR, textG, textB)
+        pcall(row.sep.SetTextColor, row.sep, sepR, sepG, sepB)
+        pcall(row.spell.SetTextColor, row.spell, textR, textG, textB)
+    end
+
+    return attempted, importantAttempted
+end
+
 local function SetCastFill(row, c, pct)
     row.fill:Show()
     if c.durationObject and row.fill.SetTimerDuration then
@@ -285,24 +554,6 @@ local function SetCastFill(row, c, pct)
     pct = math.max(0, math.min(1, pct or 0))
     row.fill:SetMinMaxValues(0, 1)
     row.fill:SetValue(pct)
-end
-
-local function SetCastOutline(row, show)
-    if show then
-        row.borderTop:SetAlpha(1)
-        row.borderBottom:SetAlpha(1)
-        row.borderLeft:SetAlpha(1)
-        row.borderRight:SetAlpha(1)
-        row.borderTop:Show()
-        row.borderBottom:Show()
-        row.borderLeft:Show()
-        row.borderRight:Show()
-    else
-        row.borderTop:Hide()
-        row.borderBottom:Hide()
-        row.borderLeft:Hide()
-        row.borderRight:Hide()
-    end
 end
 
 local function SetCastOutlineAlpha(row, alpha)
@@ -469,6 +720,17 @@ end
 
 -- Refresh cast rows
 local function RefreshCasts()
+    if not IsNearbyCastsVisibleByRules() then
+        if castFrame then
+            castFrame:Hide()
+            for i=1,#castRows do
+                if castRows[i] then
+                    castRows[i]._timerUnit=nil; castRows[i]._timerSpell=nil; castRows[i]:Hide()
+                end
+            end
+        end
+        return
+    end
     if not castFrame and BuildCastFrame then BuildCastFrame() end
     if not castFrame then return end
     local casts = MissedKick.nearbyCasts
@@ -494,54 +756,93 @@ local function RefreshCasts()
             end
         end)
         local markerShown = SetCastMarker(row, c.unit, markerForRow)
-        if markerShown then
-            row.text:ClearAllPoints(); row.text:SetPoint("LEFT", 6, 0); row.text:SetPoint("RIGHT",-28,0)
-        else
-            row.text:ClearAllPoints(); row.text:SetPoint("LEFT", 6, 0); row.text:SetPoint("RIGHT",-6,0)
-        end
         local pct = 0
         if c.endTime and c.duration then
             local rem = math.max(0, c.endTime - now)
             local dur = math.max(0.1, c.duration)
             pct = 1 - (rem / dur)
         end
-        SetCastFillColor(row, 0.78,0.46,0.06,0.86)
-        SetCastFill(row, c, pct)
         local assignedMarker = GetAssignedMarkerIndex()
         local outlineAtlasApplied = SetCastOutlineForMarker(row, assignedMarker, markerForRow, markerShown)
+        SetCastFillBounds(row, outlineAtlasApplied and CAST_OUTLINE_INSET or 0)
+        SetCastFill(row, c, pct)
+        local isImportant, importantReason = false, "blizzard-important"
+        local prefixWidth = 0
+        LayoutCastText(row, textLeft, prefixWidth)
+        local textR, textG, textB = CAST_TEXT_NORMAL_R, CAST_TEXT_NORMAL_G, CAST_TEXT_NORMAL_B
+        local sepR, sepG, sepB = CAST_SEP_NORMAL_R, CAST_SEP_NORMAL_G, CAST_SEP_NORMAL_B
+        row.bg:SetColorTexture(0.08,0.08,0.1,0.72)
+        SetCastText(row, c, "", textR, textG, textB, sepR, sepG, sepB)
+        local secretImportantAttempted = false
+        local importantFallbackAttempted = false
+        secretImportantAttempted, importantFallbackAttempted = ApplyImportantSpellTextColor(row, c)
+        isImportant = importantFallbackAttempted
         if MissedKick and MissedKick.IsDebugEnabled and MissedKick.IsDebugEnabled()
             and MissedKick.DebugPrint and now >= nextOutlineDebug then
             nextOutlineDebug = now + 1.5
             local db = GetDB()
             local assigned = db and db.myMarker or "none"
             local markerSecret = false
+            local rawEventSecret = false
+            local rawUnitSecret = false
+            local rawNameSecret = false
             if hasanysecretvalues then
                 local okSecret, isSecret = pcall(hasanysecretvalues, markerForRow)
                 markerSecret = okSecret and isSecret or false
+                local okRawEvent, isRawEventSecret = pcall(hasanysecretvalues, c.rawEventSpellID)
+                rawEventSecret = okRawEvent and isRawEventSecret or false
+                local okRawUnit, isRawUnitSecret = pcall(hasanysecretvalues, c.rawUnitSpellID)
+                rawUnitSecret = okRawUnit and isRawUnitSecret or false
+                local okRawName, isRawNameSecret = pcall(hasanysecretvalues, c.rawSpellName)
+                rawNameSecret = okRawName and isRawNameSecret or false
             end
+            local displayedSpellName = CleanLocalText(GetDisplayedSpellNameCandidate(row)) or CleanLocalText(c.spellName) or CleanLocalText(c.spellNameRaw)
+            local cleanTextureDebug = CleanLocalNumber(c.cleanSpellTexture) or CleanLocalNumber(c.rawSpellTexture)
             MissedKick.DebugPrint("outline assigned=" .. tostring(assigned)
                 .. " markerShown=" .. tostring(markerShown)
                 .. " markerSecret=" .. tostring(markerSecret)
                 .. " atlasApplied=" .. tostring(outlineAtlasApplied)
-                .. " mode=atlas-match")
+                .. " important=" .. tostring(isImportant)
+                .. " reason=" .. tostring(importantReason)
+                .. " secretAttempt=" .. tostring(secretImportantAttempted)
+                .. " importantAttempt=" .. tostring(importantFallbackAttempted)
+                .. " spellName=" .. tostring(displayedSpellName)
+                .. " spellID=" .. tostring(c.cleanSpellID or c.spellID)
+                .. " eventSpellID=" .. tostring(c.eventSpellID)
+                .. " combatLogSpellID=" .. tostring(c.combatLogSpellID)
+                .. " texture=" .. tostring(cleanTextureDebug)
+                .. " rawEventSecret=" .. tostring(rawEventSecret)
+                .. " rawUnitSecret=" .. tostring(rawUnitSecret)
+                .. " rawNameSecret=" .. tostring(rawNameSecret)
+                .. " mode=raw-spell-match")
         end
-        local dng, yours = false, false
-        if MissedKick.IsDangerousCast then
-            local okDanger, isDangerous, isYours = pcall(MissedKick.IsDangerousCast, c.spellID, c.spellName, nil)
-            if okDanger then
-                dng, yours = isDangerous, isYours
-            end
-        end
-        local prefixWidth = yours and 18 or (dng and 12 or 0)
-        LayoutCastText(row, textLeft, prefixWidth)
-        if yours then row.bg:SetColorTexture(0.18,0.02,0.02,0.9); SetCastFillColor(row, 0.9,0.08,0.06,0.88); SetCastText(row, c, "!!", 1,0.2,0.2)
-        elseif dng then row.bg:SetColorTexture(0.12,0.07,0.01,0.9); SetCastFillColor(row, 0.88,0.47,0.02,0.88); SetCastText(row, c, "!", 1,0.65,0.15)
-        else row.bg:SetColorTexture(0.08,0.08,0.1,0.72); SetCastText(row, c, "", 0.9,0.9,0.9) end
+        SetCastFillColorForTarget(row, c)
         row.time:SetText("")
         y=y+BAR_HEIGHT
     end
-    for i=#casts+1,#castRows do if castRows[i] then castRows[i]._timerUnit=nil; castRows[i]._timerSpell=nil; castRows[i].text:Hide(); castRows[i].prefix:Hide(); castRows[i].enemy:Hide(); castRows[i].sep:Hide(); castRows[i].spell:Hide(); ClearCastOutline(castRows[i]); castRows[i]:Hide() end end
+    for i=#casts+1,#castRows do if castRows[i] then castRows[i]._timerUnit=nil; castRows[i]._timerSpell=nil; castRows[i].prefix:Hide(); castRows[i].enemy:Hide(); castRows[i].sep:Hide(); castRows[i].spell:Hide(); ClearCastOutline(castRows[i]); castRows[i]:Hide() end end
     castFrame:SetHeight(math.max(y+4, HEADER_H+30))
+end
+
+local function ApplyFeatureVisibility()
+    if mainFrame then
+        if IsKickTrackerVisibleByRules() then
+            mainFrame:Show()
+            mainFrame:Raise()
+            RefreshKicks()
+        else
+            mainFrame:Hide()
+        end
+    end
+
+    if IsNearbyCastsVisibleByRules() then
+        if MissedKick and MissedKick.ScanNearbyCasts then
+            MissedKick.ScanNearbyCasts()
+        end
+        RefreshCasts()
+    elseif castFrame then
+        castFrame:Hide()
+    end
 end
 
 BuildCastFrame = function()
@@ -554,6 +855,10 @@ BuildCastFrame = function()
     castFrame:Hide()
     castFrame._refreshTimer = 0
     castFrame:SetScript("OnUpdate", function(self, elapsed)
+        if not self:IsShown() then
+            self._refreshTimer = 0
+            return
+        end
         self._refreshTimer = (self._refreshTimer or 0) + elapsed
         if self._refreshTimer >= 0.05 then
             self._refreshTimer = 0
@@ -744,37 +1049,14 @@ local function BuildMain()
 end
 
 -- Settings frame
-local listEntries = {}
-
-function RefreshDangerousList()
-    for _,e in ipairs(listEntries) do e:Hide() end
-    if not (settingsFrame and settingsFrame._dp and MissedKickDB) then return end
-    local idx = 0
-    for key in pairs(MissedKickDB.dangerousCasts) do
-        idx=idx+1
-        local row = listEntries[idx]
-        if not row then
-            row=CreateFrame("Frame",nil,settingsFrame._dp); row:SetHeight(20)
-            row.text=row:CreateFontString(nil,"OVERLAY","GameFontNormalSmall"); row.text:SetPoint("LEFT",4,0); row.text:SetJustifyH("LEFT")
-            row.del=CreateFrame("Button",nil,row); row.del:SetSize(16,16); row.del:SetPoint("RIGHT",-4,0)
-            local dx=row.del:CreateFontString(nil,"OVERLAY","GameFontNormalSmall"); dx:SetAllPoints(); dx:SetText("|cffff4444X|r")
-            listEntries[idx]=row
-        end
-        row:SetPoint("TOPLEFT",0,-(idx-1)*22); row:SetPoint("RIGHT")
-        row.text:SetText(type(key)=="number" and ("ID: "..key) or key); row.text:SetTextColor(0.9,0.7,0.2)
-        local k=key
-        row.del:SetScript("OnClick",function() if MissedKickDB then MissedKickDB.dangerousCasts[k]=nil end; RefreshDangerousList() end)
-        row:Show()
-    end
-end
-
 local function BuildSettings()
     settingsFrame=CreateFrame("Frame","MissedKickSettings",UIParent,"BackdropTemplate")
-    settingsFrame:SetSize(360,400); settingsFrame:SetPoint("CENTER")
+    settingsFrame:SetSize(440,320); settingsFrame:SetPoint("CENTER")
     settingsFrame:SetFrameStrata("DIALOG"); settingsFrame:SetMovable(true); settingsFrame:EnableMouse(true); settingsFrame:SetClampedToScreen(true)
     settingsFrame:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8x8",edgeFile="Interface\\Buttons\\WHITE8x8",edgeSize=2})
     settingsFrame:SetBackdropColor(0.06,0.06,0.1,0.95); settingsFrame:SetBackdropBorderColor(0.4,0.2,0.0,0.8)
     table.insert(UISpecialFrames,"MissedKickSettings")
+
     local sh=CreateFrame("Frame",nil,settingsFrame); sh:SetHeight(30); sh:SetPoint("TOPLEFT"); sh:SetPoint("TOPRIGHT")
     local shbg=sh:CreateTexture(nil,"BACKGROUND"); shbg:SetAllPoints(); shbg:SetColorTexture(0.1,0.08,0.14,1)
     sh:EnableMouse(true); sh:RegisterForDrag("LeftButton")
@@ -785,69 +1067,107 @@ local function BuildSettings()
     local scls=CreateFrame("Button",nil,sh); scls:SetSize(24,24); scls:SetPoint("RIGHT",-6,0)
     local scx=scls:CreateFontString(nil,"OVERLAY","GameFontNormal"); scx:SetAllPoints(); scx:SetText("|cffaa3333X|r")
     scls:SetScript("OnClick",function() settingsFrame:Hide() end)
-    local tabs,panels={},{}
-    local function SetTab(idx)
-        for i,t in ipairs(tabs) do
-            local s=(i==idx); t._bg:SetColorTexture(s and 0.2 or 0.1,s and 0.15 or 0.1,s and 0.3 or 0.15,1)
-            t._lbl:SetTextColor(s and 1 or 0.6,s and 0.8 or 0.6,s and 0.2 or 0.6)
-            if s then panels[i]:Show() else panels[i]:Hide() end
+
+    local content=CreateFrame("Frame",nil,settingsFrame)
+    content:SetPoint("TOPLEFT",12,-44); content:SetPoint("BOTTOMRIGHT",-12,12)
+    settingsFrame._dp=content
+
+    local function CreateDivider(parent, y)
+        local line=parent:CreateTexture(nil,"BACKGROUND")
+        line:SetPoint("TOPLEFT",0,y); line:SetPoint("TOPRIGHT",0,y); line:SetHeight(1)
+        line:SetColorTexture(0.22,0.18,0.10,0.85)
+        return line
+    end
+
+    local toggles = {}
+    local function TrackToggle(btn)
+        toggles[#toggles + 1] = btn
+        return btn
+    end
+
+    local function CreateFeatureToggle(parent, getValue, setValue, width, onText, offText)
+        local btn=CreateFrame("Button",nil,parent,"BackdropTemplate")
+        btn:SetSize(width or 78,24)
+        btn:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8x8",edgeFile="Interface\\Buttons\\WHITE8x8",edgeSize=1})
+        btn:SetBackdropBorderColor(0.25,0.25,0.32,1)
+        local label=btn:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+        label:SetAllPoints()
+        btn.Refresh=function(self)
+            local on=getValue()
+            self:SetBackdropColor(on and 0.12 or 0.14,on and 0.34 or 0.10,on and 0.16 or 0.10,0.9)
+            label:SetText(on and (onText or "On") or (offText or "Off"))
+            label:SetTextColor(on and 0.7 or 0.85,on and 1 or 0.35,on and 0.7 or 0.35)
         end
+        btn:SetScript("OnClick",function(self)
+            setValue(not getValue())
+            self:Refresh()
+            ApplyFeatureVisibility()
+        end)
+        btn:SetScript("OnEnter",function(self) self:SetBackdropBorderColor(0.7,0.55,0.2,1) end)
+        btn:SetScript("OnLeave",function(self) self:SetBackdropBorderColor(0.25,0.25,0.32,1) end)
+        btn:Refresh()
+        return TrackToggle(btn)
     end
-    for i,tn in ipairs({"General","Dangerous Casts"}) do
-        local tab=CreateFrame("Button",nil,settingsFrame); tab:SetSize(120,24); tab:SetPoint("TOPLEFT",(i-1)*122+8,-34)
-        tab._bg=tab:CreateTexture(nil,"BACKGROUND"); tab._bg:SetAllPoints()
-        tab._lbl=tab:CreateFontString(nil,"OVERLAY","GameFontNormalSmall"); tab._lbl:SetAllPoints(); tab._lbl:SetText(tn)
-        tab:SetScript("OnClick",function() SetTab(i) end); tabs[i]=tab
-        local p=CreateFrame("Frame",nil,settingsFrame); p:SetPoint("TOPLEFT",8,-62); p:SetPoint("BOTTOMRIGHT",-8,8); p:Hide(); panels[i]=p
+
+    local function CreateText(parent, text, x, y, template, r, g, b)
+        local fs=parent:CreateFontString(nil,"OVERLAY",template or "GameFontNormalSmall")
+        fs:SetPoint("TOPLEFT",x,y)
+        fs:SetText(text)
+        if r then fs:SetTextColor(r,g,b) end
+        return fs
     end
-    -- General tab
-    local gp=panels[1]
-    local ml=gp:CreateFontString(nil,"OVERLAY","GameFontNormal"); ml:SetPoint("TOPLEFT",0,0); ml:SetText("Your Raid Marker"); ml:SetTextColor(1,0.8,0.2)
-    local md=gp:CreateFontString(nil,"OVERLAY","GameFontNormalSmall"); md:SetPoint("TOPLEFT",0,-18)
-    md:SetText("Dangerous casts on enemies with your marker\nwill be labeled YOUR KICK."); md:SetTextColor(0.6,0.6,0.6)
+
+    CreateText(content,"|cffffcc00Load Mode|r",0,0,"GameFontNormal")
+    local loadModeToggle=CreateFeatureToggle(content,IsDungeonLoadMode,SetDungeonLoadMode,118,"Dungeons","Everywhere")
+    loadModeToggle:SetPoint("TOPRIGHT",0,4)
+
+    CreateDivider(content,-46)
+
+    local kickTitle=content:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    kickTitle:SetPoint("TOPLEFT",0,-68); kickTitle:SetText("|cffffcc00Kick Tracker|r")
+    local kickToggle=CreateFeatureToggle(content,IsKickTrackerEnabled,SetKickTrackerEnabled)
+    kickToggle:SetPoint("TOPRIGHT",0,-64)
+
+    local markerLabel=content:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+    markerLabel:SetPoint("TOPLEFT",0,-96); markerLabel:SetText("Assigned Raid Marker"); markerLabel:SetTextColor(0.8,0.8,0.8)
     local mklist={"none","star","circle","diamond","triangle","moon","square","cross","skull"}
     local mkbtns={}
     for i,mk in ipairs(mklist) do
-        local btn=CreateFrame("Button",nil,gp); btn:SetSize(36,36)
-        btn:SetPoint("TOPLEFT",((i-1)%5)*40,-52-math.floor((i-1)/5)*40)
+        local btn=CreateFrame("Button",nil,content); btn:SetSize(34,34)
+        btn:SetPoint("TOPLEFT",((i-1)%9)*40,-118)
         btn._bg=btn:CreateTexture(nil,"BACKGROUND"); btn._bg:SetAllPoints(); btn._bg:SetColorTexture(0.15,0.15,0.2,0.8)
         btn._mk=mk
         local midx=MissedKick.MARKER_NAMES[mk]
         if midx and midx>0 and MissedKick.MARKER_ICONS[midx] then
-            local ic=btn:CreateTexture(nil,"ARTWORK"); ic:SetSize(24,24); ic:SetPoint("CENTER"); ic:SetTexture(MissedKick.MARKER_ICONS[midx])
-        else local nl=btn:CreateFontString(nil,"OVERLAY","GameFontNormalSmall"); nl:SetAllPoints(); nl:SetText("None"); nl:SetTextColor(0.5,0.5,0.5) end
+            local ic=btn:CreateTexture(nil,"ARTWORK"); ic:SetSize(23,23); ic:SetPoint("CENTER"); ic:SetTexture(MissedKick.MARKER_ICONS[midx])
+        else
+            local nl=btn:CreateFontString(nil,"OVERLAY","GameFontNormalSmall"); nl:SetAllPoints(); nl:SetText("None"); nl:SetTextColor(0.5,0.5,0.5)
+        end
         btn:SetScript("OnClick",function()
             if MissedKickDB then MissedKickDB.myMarker=mk end
             for _,b in ipairs(mkbtns) do b._bg:SetColorTexture(0.15,0.15,0.2,0.8) end
             btn._bg:SetColorTexture(0.3,0.5,0.3,0.8)
             MissedKick.Print("Marker set to |cffffcc00"..mk.."|r.")
+            if MissedKick_RefreshUI then MissedKick_RefreshUI() end
         end)
         mkbtns[i]=btn
     end
-    -- Dangerous casts tab
-    local dp=CreateFrame("Frame",nil,panels[2]); dp:SetAllPoints(); settingsFrame._dp=dp
-    local dl=dp:CreateFontString(nil,"OVERLAY","GameFontNormal"); dl:SetPoint("TOPLEFT",0,0); dl:SetText("Dangerous Cast List"); dl:SetTextColor(1,0.8,0.2)
-    local dd=dp:CreateFontString(nil,"OVERLAY","GameFontNormalSmall"); dd:SetPoint("TOPLEFT",0,-18); dd:SetText("Enter a spell ID or name, then click Add."); dd:SetTextColor(0.6,0.6,0.6)
-    local inp=CreateFrame("EditBox","MKDangerousInput",dp,"InputBoxTemplate"); inp:SetSize(200,22); inp:SetPoint("TOPLEFT",0,-38); inp:SetAutoFocus(false); inp:SetFontObject("GameFontNormalSmall")
-    local ab=CreateFrame("Button",nil,dp); ab:SetSize(50,22); ab:SetPoint("LEFT",inp,"RIGHT",6,0)
-    local abbg=ab:CreateTexture(nil,"BACKGROUND"); abbg:SetAllPoints(); abbg:SetColorTexture(0.2,0.4,0.2,0.8)
-    local abl=ab:CreateFontString(nil,"OVERLAY","GameFontNormalSmall"); abl:SetAllPoints(); abl:SetText("Add")
-    ab:SetScript("OnEnter",function() abbg:SetColorTexture(0.3,0.6,0.3,0.8) end)
-    ab:SetScript("OnLeave",function() abbg:SetColorTexture(0.2,0.4,0.2,0.8) end)
-    ab:SetScript("OnClick",function()
-        local v=inp:GetText(); if not v or v=="" or not MissedKickDB then return end
-        local num=tonumber(v)
-        if num then MissedKickDB.dangerousCasts[num]=true; MissedKick.Print("Added ID |cffffcc00"..num.."|r")
-        else MissedKickDB.dangerousCasts[v]=true; MissedKick.Print("Added |cffffcc00"..v.."|r") end
-        inp:SetText(""); RefreshDangerousList()
-    end)
-    inp:SetScript("OnEnterPressed",function() ab:Click() end)
+
+    CreateDivider(content,-168)
+
+    local nearbyTitle=content:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    nearbyTitle:SetPoint("TOPLEFT",0,-190); nearbyTitle:SetText("|cffffcc00Nearby Casts|r")
+    local nearbyToggle=CreateFeatureToggle(content,IsNearbyCastsEnabled,SetNearbyCastsEnabled)
+    nearbyToggle:SetPoint("TOPRIGHT",0,-186)
+
     settingsFrame:SetScript("OnShow",function()
         local cur=MissedKickDB and MissedKickDB.myMarker or "none"
         for _,b in ipairs(mkbtns) do b._bg:SetColorTexture(b._mk==cur and 0.3 or 0.15,b._mk==cur and 0.5 or 0.15,b._mk==cur and 0.3 or 0.2,0.8) end
-        RefreshDangerousList()
+        for _,toggle in ipairs(toggles) do
+            if toggle.Refresh then toggle:Refresh() end
+        end
     end)
-    SetTab(1)
+    settingsFrame:Hide()
 end
 
 -- Public API
@@ -855,22 +1175,32 @@ function MissedKick_ShowFrame()
     if not mainFrame then BuildMain() end
     if not castFrame then BuildCastFrame() end
     PositionMainFrame(false)
-    mainFrame:Show(); mainFrame:Raise(); RefreshKicks(); MissedKick.ScanNearbyCasts(); RefreshCasts()
+    if IsKickTrackerVisibleByRules() then
+        mainFrame:Show(); mainFrame:Raise(); RefreshKicks()
+    else
+        mainFrame:Hide()
+    end
+    MissedKick.ScanNearbyCasts(); RefreshCasts()
 end
-function MissedKick_HideFrame() if mainFrame then mainFrame:Hide() end end
+function MissedKick_HideFrame() if mainFrame then mainFrame:Hide() end; if castFrame then castFrame:Hide() end end
 function MissedKick_CenterFrame()
     if not mainFrame then BuildMain() end
     if not castFrame then BuildCastFrame() end
     PositionMainFrame(true)
     PositionCastFrame(true)
-    mainFrame:Show(); mainFrame:Raise(); RefreshKicks(); RefreshCasts()
+    if IsKickTrackerVisibleByRules() then mainFrame:Show(); mainFrame:Raise(); RefreshKicks() else mainFrame:Hide() end
+    RefreshCasts()
     if MissedKick and MissedKick.Print then MissedKick.Print("Tracker moved to center.") end
 end
 function MissedKick_UpdateLock() end
 function MissedKick_RefreshCasts() RefreshCasts() end
-function MissedKick_RefreshUI() if mainFrame and mainFrame:IsShown() then RefreshKicks() end; RefreshCasts() end
+function MissedKick_RefreshUI() ApplyFeatureVisibility() end
 function MissedKick_ToggleSettings()
-    if not settingsFrame then BuildSettings() end
+    if not settingsFrame then
+        BuildSettings()
+        settingsFrame:Show()
+        return
+    end
     if settingsFrame:IsShown() then settingsFrame:Hide() else settingsFrame:Show() end
 end
 
