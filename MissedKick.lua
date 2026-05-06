@@ -23,6 +23,7 @@
 
 local ADDON_NAME = "MissedKick"
 local ADDON_PREFIX = "MISSEDKICK"
+local ADDON_VERSION = "1.0.3"
 local ADDON_BUILD = "2026-05-05-sync-cooldown-safe"
 
 -------------------------------------------------------------------------------
@@ -188,6 +189,7 @@ end
 -- Public API (accessed by UI.lua)
 -------------------------------------------------------------------------------
 MissedKick = {
+    VERSION             = ADDON_VERSION,
     BUILD               = ADDON_BUILD,
     INTERRUPT_SPELLS    = INTERRUPT_SPELLS,
     INTERRUPT_IDS       = INTERRUPT_IDS,
@@ -1639,7 +1641,7 @@ local function HandleSlash(msg)
         Print("  /mk reset - Clear all cooldowns")
         Print("  /mk debug - Toggle debug logging")
         Print("  /mk fakeparty - Simulate a party member kick")
-        Print("  /mk version - Show loaded build")
+        Print("  /mk version - Show addon version")
 
     elseif cmd == "menu" then
         if MissedKick_ToggleSettings then MissedKick_ToggleSettings() end
@@ -1659,7 +1661,7 @@ local function HandleSlash(msg)
         Print("Debug logging " .. (debugEnabled and "|cff00ff00enabled|r." or "|cffff8800disabled|r."))
 
     elseif cmd == "version" then
-        Print("Build |cffffcc00" .. ADDON_BUILD .. "|r")
+        Print("Missed Kick |cffffcc00v" .. ADDON_VERSION .. "|r")
 
     elseif cmd == "fakeparty" then
         SimulatePartyKick()
@@ -1768,7 +1770,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         if not initOk then
             Print("|cffff0000Init error:|r " .. tostring(initErr))
         else
-            Print("|cff00ff00Loaded!|r Build |cffffcc00" .. ADDON_BUILD .. "|r. Type |cff88ccff/mk help|r for commands.")
+            Print("|cff00ff00Loaded!|r v|cffffcc00" .. ADDON_VERSION .. "|r. Type |cff88ccff/mk help|r for commands.")
         end
         self:UnregisterEvent("ADDON_LOADED")
 
