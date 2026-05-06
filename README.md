@@ -49,7 +49,7 @@ The tracker windows can be moved by dragging their headers. Right-click a window
 
 ## Party Sync
 
-Missed Kick can always track your own interrupt cooldown locally. To see another party member's cooldown reliably, that player also needs Missed Kick installed. The addon syncs cooldown messages through Blizzard's addon messaging system and does not post visible chat messages.
+Missed Kick can always track your own interrupt cooldown locally. To see another party member's cooldown reliably, that player also needs Missed Kick installed. The addon syncs cooldown messages through Blizzard's addon messaging system.
 
 ## Nearby Casts
 
