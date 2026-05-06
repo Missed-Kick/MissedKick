@@ -954,7 +954,6 @@ local function BuildMain()
     mainFrame:SetMovable(true); mainFrame:EnableMouse(true); mainFrame:SetClampedToScreen(true)
     mainFrame:SetBackdrop({bgFile="Interface\\Buttons\\WHITE8x8",edgeFile="Interface\\Buttons\\WHITE8x8",edgeSize=1})
     mainFrame:SetBackdropColor(0.05,0.05,0.08,0.92); mainFrame:SetBackdropBorderColor(0.15,0.15,0.2,0.8)
-    table.insert(UISpecialFrames,"MissedKickFrame")
 
     -- Position: restore from saved or default to center
     PositionMainFrame(false)
