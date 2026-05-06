@@ -23,7 +23,7 @@
 
 local ADDON_NAME = "MissedKick"
 local ADDON_PREFIX = "MISSEDKICK"
-local ADDON_VERSION = "1.0.3"
+local ADDON_VERSION = "1.0.4"
 local ADDON_BUILD = "2026-05-05-sync-cooldown-safe"
 
 -------------------------------------------------------------------------------
@@ -171,12 +171,16 @@ end
 -- Rate limiting for addon messages
 local lastBroadcast = 0
 local BROADCAST_THROTTLE = 0.5  -- seconds between broadcasts
+local lastHelloBroadcast = 0
+local HELLO_THROTTLE = 1.0      -- seconds between presence broadcasts
+local helloBroadcastScheduled = false
 local rosterRebuildScheduled = false
 local testCastsUntil = 0
 local debugEnabled = false
 local lastDebugByKey = {}
 local pendingNearbyCastEvents = {}
 local PENDING_CAST_TTL = 2
+local BroadcastHello
 
 local PARTY_CATEGORY_HOME = LE_PARTY_CATEGORY_HOME
 local PARTY_CATEGORY_INSTANCE = LE_PARTY_CATEGORY_INSTANCE
@@ -585,6 +589,7 @@ end
 -- Sends kick data to party members who also have the addon.
 --
 -- Protocol: "KICK;spellID;cooldownDuration"
+--           "HELLO;version;spellID;cooldownDuration"
 -- Channel: PARTY or INSTANCE_CHAT (whichever is appropriate)
 -------------------------------------------------------------------------------
 local function IsInGroupCategory(category)
@@ -619,6 +624,46 @@ local function GetAddonMessageChannels()
     end
 
     return channels
+end
+
+BroadcastHello = function(force)
+    local now = GetTime()
+    if not force and now - lastHelloBroadcast < HELLO_THROTTLE then return end
+
+    if not mySpellID then
+        pcall(FindMyInterrupt)
+    end
+
+    local spellID = mySpellID or ""
+    local cd = mySpellCD or 0
+    local payload = "HELLO;" .. ADDON_VERSION .. ";" .. tostring(spellID) .. ";" .. string.format("%.1f", cd)
+    local channels = GetAddonMessageChannels()
+    local sent = false
+
+    for _, channel in ipairs(channels) do
+        local ok, result = pcall(C_ChatInfo.SendAddonMessage, ADDON_PREFIX, payload, channel)
+        if ok and result ~= false then
+            sent = true
+        end
+        DebugPrint("sent hello channel=" .. tostring(channel) .. " ok=" .. tostring(ok) .. " result=" .. tostring(result))
+    end
+
+    if sent then
+        lastHelloBroadcast = now
+    else
+        DebugPrint("hello sync not sent; no usable group addon channel")
+    end
+end
+
+local function ScheduleHelloBroadcast()
+    if helloBroadcastScheduled then return end
+    helloBroadcastScheduled = true
+
+    C_Timer.After(0.3, function() pcall(BroadcastHello, true) end)
+    C_Timer.After(2.0, function()
+        helloBroadcastScheduled = false
+        pcall(BroadcastHello, true)
+    end)
 end
 
 local function BroadcastKick(spellID, cd)
@@ -658,7 +703,35 @@ local function OnAddonMessage(prefix, message, channel, sender)
     local parts = { strsplit(";", message) }
     local cmd = parts[1]
 
-    if cmd == "KICK" then
+    if cmd == "HELLO" then
+        local version = parts[2]
+        local spellID = tonumber(parts[3])
+        local cd      = tonumber(parts[4])
+        local entry = partyKicks[shortName]
+        local wasKnown = entry and entry.hasAddon
+
+        if entry then
+            entry.hasAddon = true
+            if spellID then entry.spellID = spellID end
+            if cd and cd > 0 then entry.cdDuration = cd end
+        else
+            partyKicks[shortName] = {
+                spellID = spellID,
+                cdEnd = 0,
+                cdDuration = (cd and cd > 0) and cd or nil,
+                hasAddon = true,
+                isSelf = false,
+            }
+        end
+
+        DebugPrint("received hello sender=" .. tostring(shortName) .. " version=" .. tostring(version) .. " spellID=" .. tostring(spellID) .. " cd=" .. tostring(cd))
+        if MissedKick_RefreshUI then MissedKick_RefreshUI() end
+
+        if not wasKnown then
+            C_Timer.After(0.2, function() pcall(BroadcastHello, true) end)
+        end
+
+    elseif cmd == "KICK" then
         local spellID = tonumber(parts[2])
         local cd      = tonumber(parts[3])
         if spellID and cd and cd > 0 then
@@ -1765,6 +1838,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             -- Find our interrupt (may fail if APIs aren't ready)
             FindMyInterrupt()
             RebuildPartyRoster()
+            ScheduleHelloBroadcast()
         end)
 
         if not initOk then
@@ -1798,6 +1872,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
 
             FindMyInterrupt()
             RebuildPartyRoster()
+            ScheduleHelloBroadcast()
         end)
         if not ok then
             Print("|cffff0000World entry error:|r " .. tostring(err))
@@ -1836,6 +1911,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
 
     elseif event == "GROUP_ROSTER_UPDATE" then
         ScheduleRosterRebuild()
+        ScheduleHelloBroadcast()
         if MissedKick_RefreshUI then MissedKick_RefreshUI() end
 
     elseif event == "CHAT_MSG_ADDON" then
