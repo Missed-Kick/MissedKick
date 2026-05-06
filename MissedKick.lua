@@ -23,7 +23,7 @@
 
 local ADDON_NAME = "MissedKick"
 local ADDON_PREFIX = "MISSEDKICK"
-local ADDON_BUILD = "2026-05-05-sync-channel-fix"
+local ADDON_BUILD = "2026-05-05-sync-cooldown-safe"
 
 -------------------------------------------------------------------------------
 -- Interrupt Spell Table
@@ -486,10 +486,19 @@ local function RefreshCooldownFromSpell(spellID, fallbackCd)
     if C_Spell and C_Spell.GetSpellCooldown then
         local ok, info = pcall(C_Spell.GetSpellCooldown, spellID)
         if ok and info then
-            local okD, dur = pcall(function() return info.duration end)
-            if okD and dur and dur > 1.5 then
-                mySpellCD = dur
-                return dur
+            local cleanDuration
+            pcall(function()
+                cleanDuration = CleanNumber(info.duration)
+            end)
+            if cleanDuration then
+                local usable = false
+                pcall(function()
+                    usable = cleanDuration > 1.5
+                end)
+                if usable then
+                    mySpellCD = cleanDuration
+                    return cleanDuration
+                end
             end
         end
     end
