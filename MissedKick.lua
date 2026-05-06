@@ -23,7 +23,7 @@
 
 local ADDON_NAME = "MissedKick"
 local ADDON_PREFIX = "MISSEDKICK"
-local ADDON_BUILD = "2026-05-05-dungeon-load-mode"
+local ADDON_BUILD = "2026-05-05-sync-channel-fix"
 
 -------------------------------------------------------------------------------
 -- Interrupt Spell Table
@@ -176,6 +176,13 @@ local debugEnabled = false
 local lastDebugByKey = {}
 local pendingNearbyCastEvents = {}
 local PENDING_CAST_TTL = 2
+
+local PARTY_CATEGORY_HOME = LE_PARTY_CATEGORY_HOME
+local PARTY_CATEGORY_INSTANCE = LE_PARTY_CATEGORY_INSTANCE
+if Enum and Enum.PartyCategory then
+    PARTY_CATEGORY_HOME = PARTY_CATEGORY_HOME or Enum.PartyCategory.Home
+    PARTY_CATEGORY_INSTANCE = PARTY_CATEGORY_INSTANCE or Enum.PartyCategory.Instance
+end
 
 -------------------------------------------------------------------------------
 -- Public API (accessed by UI.lua)
@@ -569,20 +576,59 @@ end
 -- Protocol: "KICK;spellID;cooldownDuration"
 -- Channel: PARTY or INSTANCE_CHAT (whichever is appropriate)
 -------------------------------------------------------------------------------
+local function IsInGroupCategory(category)
+    if category ~= nil and IsInGroup then
+        local ok, inGroup = pcall(IsInGroup, category)
+        if ok then return inGroup end
+    end
+    return false
+end
+
+local function GetAddonMessageChannels()
+    local channels = {}
+    local inHome = IsInGroupCategory(PARTY_CATEGORY_HOME)
+    local inInstance = IsInGroupCategory(PARTY_CATEGORY_INSTANCE)
+    local inAnyGroup = false
+
+    if IsInGroup then
+        local ok, grouped = pcall(IsInGroup)
+        inAnyGroup = ok and grouped or false
+    end
+
+    if inInstance then
+        channels[#channels + 1] = "INSTANCE_CHAT"
+    end
+
+    if inHome then
+        channels[#channels + 1] = (IsInRaid and IsInRaid()) and "RAID" or "PARTY"
+    end
+
+    if #channels == 0 and inAnyGroup then
+        channels[#channels + 1] = (IsInRaid and IsInRaid()) and "RAID" or "PARTY"
+    end
+
+    return channels
+end
+
 local function BroadcastKick(spellID, cd)
     local now = GetTime()
     if now - lastBroadcast < BROADCAST_THROTTLE then return end
     lastBroadcast = now
 
     local payload = "KICK;" .. spellID .. ";" .. string.format("%.1f", cd)
+    local channels = GetAddonMessageChannels()
+    local sent = false
 
-    local inInstance = IsInGroup(LE_PARTY_CATEGORY_INSTANCE)
-    local inHome     = IsInGroup(LE_PARTY_CATEGORY_HOME)
+    for _, channel in ipairs(channels) do
+        local ok, result = pcall(C_ChatInfo.SendAddonMessage, ADDON_PREFIX, payload, channel)
+        if ok and result ~= false then
+            sent = true
+        end
+        DebugPrint("sent kick channel=" .. tostring(channel) .. " ok=" .. tostring(ok) .. " result=" .. tostring(result))
+    end
 
-    if inInstance then
-        pcall(C_ChatInfo.SendAddonMessage, ADDON_PREFIX, payload, "INSTANCE_CHAT")
-    elseif inHome then
-        pcall(C_ChatInfo.SendAddonMessage, ADDON_PREFIX, payload, "PARTY")
+    if not sent then
+        DebugPrint("kick sync not sent; no usable group addon channel")
     end
 end
 
@@ -592,6 +638,7 @@ end
 -------------------------------------------------------------------------------
 local function OnAddonMessage(prefix, message, channel, sender)
     if prefix ~= ADDON_PREFIX then return end
+    DebugPrint("addon msg channel=" .. tostring(channel) .. " sender=" .. tostring(sender) .. " msg=" .. tostring(message))
 
     -- Strip realm from sender name
     local shortName = Ambiguate(sender, "short")

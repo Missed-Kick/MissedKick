@@ -2,7 +2,7 @@
 ## Title: |cffff4444Missed|r |cffffcc00Kick|r
 ## Notes: Interrupt cooldown tracker with party sync and nearby enemy cast tracking.
 ## Author: MissedKick
-## Version: 1.0.0
+## Version: 1.0.1
 ## SavedVariables: MissedKickDB
 ## IconTexture: Interface\Icons\ability_kick
 ## Category: Combat
